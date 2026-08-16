@@ -1,4 +1,13 @@
-"""Stitch captured frames into an mp4, with optional date range filtering."""
+"""Stitch captured frames into an mp4, with optional date range filtering.
+
+Before building, frames are scanned for this camera family's signature
+decode artifact -- a thin vivid-green vertical line at an HEVC tile
+boundary (the nonconforming tiled stream occasionally loses a NALU and the
+tile edge mis-stitches, persisting until the next keyframe). Flagged
+frames are deleted so they never appear in a video: the line only ever
+shows as one isolated saturated-green column, which nothing in a real
+scene (grass and trees are broad and far less saturated) reproduces.
+"""
 
 from __future__ import annotations
 
@@ -9,10 +18,13 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
+from PIL import Image
+
 from .config import Setup
 from .rtsp import check_ffmpeg, no_console_kwargs
 
 FRAME_STEM_LEN = len("20260815_143000")  # YYYYMMDD_HHMMSS
+GREEN_LINE_MIN_HEIGHT_FRAC = 0.25  # line must span at least this much of the frame
 
 
 def _frame_date(filename: str) -> Optional[dt.date]:
@@ -21,6 +33,53 @@ def _frame_date(filename: str) -> Optional[dt.date]:
         return dt.datetime.strptime(stem, "%Y%m%d_%H%M%S").date()
     except ValueError:
         return None
+
+
+def has_green_line(path: Path) -> bool:
+    """True when the frame carries the green tile-boundary line artifact
+    (or can't be decoded at all, which would break the build anyway)."""
+    try:
+        im = Image.open(path)
+        im.draft("RGB", (384, 216))  # fast JPEG partial decode
+        im = im.convert("RGB").resize((192, 108))
+    except Exception:
+        return True
+    w, h = im.size
+    px = im.load()
+    counts = [0] * w
+    for x in range(w):
+        c = 0
+        for y in range(h):
+            r, g, b = px[x, y]
+            if g > 120 and g > 1.6 * r and g > 1.6 * b:
+                c += 1
+        counts[x] = c
+    need = h * GREEN_LINE_MIN_HEIGHT_FRAC
+    for x in range(w):
+        if counts[x] >= need:
+            left = counts[x - 3] if x >= 3 else 0
+            right = counts[x + 3] if x + 3 < w else 0
+            if left < counts[x] / 2 and right < counts[x] / 2:  # isolated column
+                return True
+    return False
+
+
+def prune_corrupt_frames(frame_paths: List[Path]) -> List[Path]:
+    """Delete frames flagged by has_green_line; return the survivors."""
+    kept: List[Path] = []
+    removed = 0
+    for p in frame_paths:
+        if has_green_line(p):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+            removed += 1
+        else:
+            kept.append(p)
+    if removed:
+        print(f"Removed {removed} corrupted frame(s) (green tile-boundary line).")
+    return kept
 
 
 def _collect_frames(frames_dir: str) -> List[Path]:
@@ -65,6 +124,7 @@ def build_timelapse(
             and (start_date is None or d >= start_date)
             and (end_date is None or d <= end_date)
         ]
+    frame_paths = prune_corrupt_frames(frame_paths)
     if not frame_paths:
         sys.exit(f"ERROR: no matching .jpg frames found in '{frames_dir}'.")
 

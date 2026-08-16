@@ -2,3 +2,4 @@ PyYAML>=6.0
 astral>=3.2
 tzdata>=2024.1; sys_platform == "win32"
 tzlocal>=5.0
+Pillow>=10.0

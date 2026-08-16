@@ -18,9 +18,12 @@ Built for day+ unattended runs:
   sequence suffix makes every frame unique at any interval while the
   15-char timestamp prefix keeps build.py's date filtering and
   chronological name-sorting working.
-- Decode uses -hwaccel auto: NVDEC/QSV/etc. when the machine has it
-  (verified against the real camera -- 4K HEVC decode moves off the CPU),
-  silent fallback to software when it doesn't.
+- Decode is deliberately software-only. GPU decode (-hwaccel auto /
+  NVDEC) was tried for the CPU saving, but on this camera family's
+  nonconforming tiled HEVC (PPS re-sent mid-frame) NVDEC mis-stitches
+  tile boundaries into a vivid-green vertical line: decoding the same
+  recorded 10-minute stream twice gave 0 line frames in software vs 401
+  with NVDEC. Correct frames beat the ~25%-of-one-core decode cost.
 - Two layers against green-smear corruption (verified against a
   deliberately damaged copy of the real stream): -fflags discardcorrupt
   drops the packets/frames ffmpeg actually flags as corrupt, and -- the
@@ -87,7 +90,6 @@ def start_capture_process(setup: Setup, session_dir: str) -> subprocess.Popen:
         ffmpeg_bin,
         "-loglevel", "error", "-nostats",
         "-fflags", "discardcorrupt",
-        "-hwaccel", "auto",
         "-rtsp_transport", "tcp",
         "-timeout", "10000000",  # 10s connect/read timeout (microseconds)
         "-i", rtsp_url,

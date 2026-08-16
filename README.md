@@ -239,12 +239,15 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   robust.
 - Frames are named by timestamp (`%Y%m%d_%H%M%S.jpg`), so they sort
   chronologically for free and `build --date` can filter by day.
-- Two protections keep corrupted frames (green smears from a network or
-  camera hiccup) out of your timelapses. Frames ffmpeg flags as corrupt
-  are dropped instead of saved (`-fflags discardcorrupt`), and capture
-  intervals of 5 seconds or more save only **keyframes** — the
-  self-contained frames the camera sends every couple of seconds that
-  can't inherit smearing from earlier damage. Neither shortens your
-  videos: a slot just gets the next clean frame, at worst a couple of
-  seconds later. Intervals under 5s (including sub-second capture) still
-  save every frame, where a rare smeared frame can slip through.
+- Three protections keep corrupted frames out of your timelapses. Frames
+  ffmpeg flags as corrupt are dropped instead of saved (`-fflags
+  discardcorrupt`); capture intervals of 5 seconds or more save only
+  **keyframes** — the self-contained frames the camera sends every couple
+  of seconds that can't inherit smearing from earlier damage; and every
+  build first scans its frames for the **green tile-boundary line** some
+  Reolink HEVC streams produce (a thin vivid-green vertical stripe at a
+  fixed position) and deletes any frame carrying it. None of these
+  shorten your videos meaningfully: a slot just gets the next clean
+  frame. (Recording the stream to a video file instead of frames was
+  considered for this and doesn't help — the same damaged bits meet the
+  same decoder at build time.)
