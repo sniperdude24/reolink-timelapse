@@ -5,7 +5,7 @@ import datetime as dt
 import getpass
 from typing import Optional
 
-from .config import Camera, Config, Recording, Schedule, default_setup_dirs, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, is_valid_timezone
 from .build import build_timelapse
 from .scheduler import run_scheduled
 
@@ -147,25 +147,15 @@ def cmd_record(args: argparse.Namespace) -> None:
             break
         print("  Interval must be greater than 0.")
 
-    default_frames, default_output = default_setup_dirs(args.name)
-    frames_dir = _prompt(
-        "Folder to save frames",
-        existing.frames_dir if existing else str(default_frames),
-    )
-    output_dir = _prompt(
-        "Folder to save finished videos",
-        existing.output_dir if existing else str(default_output),
-    )
-
     sched = _prompt_schedule(existing.schedule if existing else None)
 
     recording = Recording(
-        name=args.name, camera_name=camera_name, interval=interval,
-        frames_dir=frames_dir, output_dir=output_dir, schedule=sched,
+        name=args.name, camera_name=camera_name, interval=interval, schedule=sched,
     )
     config.put_recording(recording)
     config.save()
     print(f"\nSaved recording '{args.name}' to {config.path}")
+    print(f"Frames and videos will save under: {recording.output_dir}")
 
 
 def cmd_list(args: argparse.Namespace) -> None:

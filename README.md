@@ -34,9 +34,10 @@ frames, and videos also defaulting to inside that same folder (see
   panel: add cameras, add scheduled recordings against them (with a
   click-to-pick location map and a timezone dropdown you can also
   auto-detect from the PC's own settings), start/stop capture, see live
-  status and log output, and build videos, all from one window. No terminal
-  needed. This is the one to hand to someone who isn't going to use a
-  command line.
+  status and log output, build videos, and open your latest finished
+  videos straight from the Latest Videos panel (double-click plays one),
+  all from one window. No terminal needed. This is the one to hand to
+  someone who isn't going to use a command line.
 - **`reolink-timelapse.exe`** — the command-line version below, for
   scripting or a headless setup (e.g. a server you SSH into to check on it).
 
@@ -72,8 +73,9 @@ Add a camera — connection details only:
 python -m reolink_timelapse configure backyard
 ```
 
-Add a recording against it — where to store frames/videos and the capture
-schedule:
+Add a recording against it — interval and capture schedule (frames and
+videos save automatically under the program folder, see
+[Where things are stored](#where-things-are-stored)):
 
 ```bash
 python -m reolink_timelapse record backyard --camera backyard
@@ -165,27 +167,22 @@ existed) unless you filter by date.
 
 ## Where things are stored
 
-Config, frames, and videos all default into one **program folder** — the
-exe's own folder for the packaged build, or the repo root for a source run
-— so a whole install (app + settings + captured media) can be copied to
-another machine or a USB drive as a single unit:
+Everything auto-saves into one **program folder** — the exe's own folder
+for the packaged build, or the repo root for a source run — so a whole
+install (app + settings + captured media) can be copied to another machine
+or a USB drive as a single unit. There's nothing to configure:
 
-- **Config** (camera credentials, and each recording's schedule/output
-  settings) defaults to `config.yaml` in the program folder, storing
-  cameras and recordings as two separate lists so multiple recordings can
-  share one camera. If you're upgrading from an older version, the first
-  run automatically migrates forward any existing config it finds — both
-  the older single-camera-per-setup schema (each becomes one camera plus
-  one recording of the same name) and, before that, the old config location
-  (`%APPDATA%\reolink-timelapse\config.yaml` on Windows,
-  `~/.config/reolink-timelapse/config.yaml` elsewhere) — nothing already
+- **Config** (camera credentials, and each recording's schedule) lives in
+  `config.yaml` in the program folder, storing cameras and recordings as
+  two separate lists so multiple recordings can share one camera. If
+  you're upgrading from an older version, the first run automatically
+  migrates forward any existing config it finds — nothing already
   configured gets lost.
-- **Frames** default to `<program folder>\Timelapses\<recording-name>\frames\<session>\`,
-  and **finished videos** to `<program folder>\Timelapses\<recording-name>\`.
-
-Both are just defaults, suggested during `record`/the GUI's Add Recording
-dialog — point `frames_dir`/`output_dir` at a separate drive per recording
-if you'd rather keep media outside the program folder.
+- **Frames** save to `<program folder>\Timelapses\<recording-name>\frames\<session>\`,
+  and **finished videos** to `<program folder>\Timelapses\<recording-name>\`
+  — always, derived from the recording's name. (Older versions let these
+  be customized per recording; any previously customized folders are left
+  in place on disk but are no longer read or written.)
 
 Note for source runs: `config.yaml` (which holds plaintext camera
 credentials) ends up sitting directly in the repo working directory. It's

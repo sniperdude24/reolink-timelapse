@@ -1,10 +1,10 @@
 """Persistent, multi-setup configuration.
 
-Config, frames, and videos all default to living inside one "program
-folder" -- the running .exe's own folder when packaged, or the repo root
-when running from source -- so a whole install (app + settings + captured
-media) can be copied to another machine or a USB drive as a single unit.
-Per-setup frames_dir/output_dir can still be pointed elsewhere.
+Config, frames, and videos all live inside one "program folder" -- the
+running .exe's own folder when packaged, or the repo root when running
+from source -- so a whole install (app + settings + captured media) can be
+copied to another machine or a USB drive as a single unit. Storage
+locations are derived from each recording's name, not configured.
 """
 
 from __future__ import annotations
@@ -41,9 +41,9 @@ def app_root_dir() -> Path:
 
 
 def default_setup_dirs(name: str) -> tuple[Path, Path]:
-    """Default (frames_dir, output_dir) for a new setup, under the program
-    folder's Timelapses/<name>/. The one place this is computed -- used by
-    both the CLI wizard and the GUI's Add/Edit dialog."""
+    """The (frames_dir, output_dir) for a recording, always under the
+    program folder's Timelapses/<name>/. The one place this is computed --
+    everything else derives storage from here."""
     base = app_root_dir() / "Timelapses" / name
     return base / "frames", base
 
@@ -117,18 +117,32 @@ class Camera:
 
 @dataclass
 class Recording:
-    """A schedule/output configuration for capturing from a named Camera."""
+    """A schedule configuration for capturing from a named Camera.
+
+    Frames and finished videos always live under the program folder's
+    Timelapses/<name>/ -- derived from the name, not stored, so every
+    install is self-contained and configs can't point at stale locations.
+    """
     name: str
     camera_name: str
     interval: float = 30
-    frames_dir: str = "frames"
-    output_dir: str = "."
     schedule: Schedule = field(default_factory=Schedule)
+
+    @property
+    def frames_dir(self) -> str:
+        return str(default_setup_dirs(self.name)[0])
+
+    @property
+    def output_dir(self) -> str:
+        return str(default_setup_dirs(self.name)[1])
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "Recording":
         sched = Schedule(**data.get("schedule", {}))
-        kwargs = {k: v for k, v in data.items() if k != "schedule"}
+        # frames_dir/output_dir were stored (and customizable) in older
+        # configs -- discard them; storage is derived from the name now.
+        kwargs = {k: v for k, v in data.items()
+                  if k not in ("schedule", "frames_dir", "output_dir")}
         return cls(name=name, schedule=sched, **kwargs)
 
     def to_dict(self) -> dict:
@@ -188,8 +202,6 @@ class Config:
             recordings[name] = {
                 "camera_name": name,
                 "interval": data.get("interval", 30),
-                "frames_dir": data.get("frames_dir", "frames"),
-                "output_dir": data.get("output_dir", "."),
                 "schedule": data.get("schedule", {}),
             }
         return {"cameras": cameras, "recordings": recordings}

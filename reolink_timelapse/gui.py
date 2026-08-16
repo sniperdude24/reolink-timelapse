@@ -10,14 +10,14 @@ import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 from typing import Optional
 from zoneinfo import available_timezones
 
 import tzlocal
 
 from .build import build_timelapse
-from .config import Camera, Config, Recording, Schedule, default_setup_dirs, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, is_valid_timezone
 from .scheduler import next_window, run_scheduled
 
 _TIMEZONES = sorted(available_timezones())
@@ -75,7 +75,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Reolink Timelapse")
-        root.geometry("900x620")
+        root.geometry("1200x620")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.config = Config()
@@ -84,6 +84,7 @@ class App:
         self._closed = False
         self._closing = False
         self._window_refresh_tick = 0
+        self._videos_cache: list = []
 
         self._build_widgets()
         if self.config.migrated_from:
@@ -99,7 +100,30 @@ class App:
     # ---- layout ----
 
     def _build_widgets(self) -> None:
-        cameras_frame = ttk.LabelFrame(self.root, text="Added Cameras")
+        content = ttk.Frame(self.root)
+        content.pack(fill="both", expand=True)
+        left = ttk.Frame(content)
+        left.pack(side="left", fill="both", expand=True)
+
+        videos_frame = ttk.LabelFrame(content, text="Latest Videos")
+        videos_frame.pack(side="right", fill="y", padx=(4, 8), pady=8)
+        self.videos_tree = ttk.Treeview(
+            videos_frame, columns=("recording", "created"), show="tree headings", height=22
+        )
+        self.videos_tree.heading("#0", text="Video")
+        self.videos_tree.heading("recording", text="Recording")
+        self.videos_tree.heading("created", text="Created")
+        self.videos_tree.column("#0", width=250)
+        self.videos_tree.column("recording", width=90)
+        self.videos_tree.column("created", width=110)
+        self.videos_tree.pack(fill="both", expand=True, padx=4, pady=(4, 2))
+        self.videos_tree.bind("<Double-1>", self.on_play_video)
+        videos_toolbar = ttk.Frame(videos_frame)
+        videos_toolbar.pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(videos_toolbar, text="Play", command=self.on_play_video).pack(side="left", padx=2)
+        ttk.Button(videos_toolbar, text="Show in Folder", command=self.on_show_video_folder).pack(side="left", padx=2)
+
+        cameras_frame = ttk.LabelFrame(left, text="Added Cameras")
         cameras_frame.pack(fill="x", padx=8, pady=(8, 4))
 
         cameras_toolbar = ttk.Frame(cameras_frame)
@@ -124,7 +148,7 @@ class App:
         self.camera_tree.column("stream", width=90)
         self.camera_tree.pack(fill="x", padx=4, pady=(0, 4))
 
-        recordings_frame = ttk.LabelFrame(self.root, text="Scheduled Recordings")
+        recordings_frame = ttk.LabelFrame(left, text="Scheduled Recordings")
         recordings_frame.pack(fill="x", padx=8, pady=(4, 4))
 
         recordings_toolbar = ttk.Frame(recordings_frame)
@@ -156,7 +180,7 @@ class App:
         self.recording_tree.column("status", width=90)
         self.recording_tree.pack(fill="x", padx=4, pady=(0, 4))
 
-        log_frame = ttk.LabelFrame(self.root, text="Log")
+        log_frame = ttk.LabelFrame(left, text="Log")
         log_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.log_text = tk.Text(log_frame, height=16, state="disabled", wrap="word")
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
@@ -169,6 +193,61 @@ class App:
     def refresh_lists(self) -> None:
         self._refresh_camera_tree()
         self._refresh_recording_tree()
+        self._refresh_videos_tree()
+
+    def _scan_latest_videos(self) -> list:
+        """[(mtime, path, recording_name)] for the newest ~20 built videos
+        across every recording's output folder."""
+        entries = []
+        for name, r in self.config.recordings.items():
+            out = Path(r.output_dir)
+            if not out.is_dir():
+                continue
+            for p in out.glob("*.mp4"):
+                try:
+                    entries.append((p.stat().st_mtime, str(p), name))
+                except OSError:
+                    continue
+        entries.sort(reverse=True)
+        return entries[:20]
+
+    def _refresh_videos_tree(self) -> None:
+        # Rebuild only when the file set actually changed, so the panel
+        # updates within a tick of a new build finishing without churning
+        # selection every second.
+        entries = self._scan_latest_videos()
+        if entries == self._videos_cache:
+            return
+        self._videos_cache = entries
+        selected = self._tree_selection(self.videos_tree)
+        self.videos_tree.delete(*self.videos_tree.get_children())
+        for mtime, path, name in entries:
+            created = dt.datetime.fromtimestamp(mtime).strftime("%b %d %I:%M %p")
+            self.videos_tree.insert("", "end", iid=path, text=os.path.basename(path),
+                                     values=(name, created))
+        if selected and self.videos_tree.exists(selected):
+            self.videos_tree.selection_set(selected)
+
+    def selected_video(self) -> Optional[str]:
+        return self._tree_selection(self.videos_tree)
+
+    def on_play_video(self, _event=None) -> None:
+        path = self.selected_video()
+        if not path:
+            messagebox.showinfo("Play Video", "Select a video first.")
+            return
+        if not os.path.exists(path):
+            messagebox.showerror("Play Video", "That video no longer exists.")
+            self._refresh_videos_tree()
+            return
+        os.startfile(path)  # Windows only, matches this project's target platform
+
+    def on_show_video_folder(self) -> None:
+        path = self.selected_video()
+        if not path:
+            messagebox.showinfo("Show in Folder", "Select a video first.")
+            return
+        os.startfile(os.path.dirname(path))
 
     def _refresh_camera_tree(self) -> None:
         selected = self._tree_selection(self.camera_tree)
@@ -240,6 +319,7 @@ class App:
                 recording = self.config.recordings.get(iid)
                 if recording:
                     self.recording_tree.set(iid, "window", self._window_label(recording))
+        self._refresh_videos_tree()
         self.root.after(1000, self._refresh_status_loop)
 
     def _tree_selection(self, tree: ttk.Treeview) -> Optional[str]:
@@ -570,33 +650,6 @@ class RecordingDialog(tk.Toplevel):
                   foreground="gray").pack(anchor="w", pady=(2, 0))
         add_row("Seconds between frames", interval_container)
 
-        default_frames, default_output = default_setup_dirs(existing.name if existing else "recording")
-        self.frames_dir_var = tk.StringVar(
-            value=existing.frames_dir if existing else str(default_frames)
-        )
-        frames_frame = ttk.Frame(self)
-        ttk.Entry(frames_frame, textvariable=self.frames_dir_var, width=38).pack(side="left")
-        ttk.Button(frames_frame, text="Browse...",
-                   command=lambda: self._browse(self.frames_dir_var)).pack(side="left", padx=4)
-        add_row("Frames folder", frames_frame)
-
-        self.output_dir_var = tk.StringVar(
-            value=existing.output_dir if existing else str(default_output)
-        )
-        output_frame = ttk.Frame(self)
-        ttk.Entry(output_frame, textvariable=self.output_dir_var, width=38).pack(side="left")
-        ttk.Button(output_frame, text="Browse...",
-                   command=lambda: self._browse(self.output_dir_var)).pack(side="left", padx=4)
-        add_row("Video output folder", output_frame)
-
-        # Default folders follow the recording name as it's typed, but only
-        # while the user hasn't edited them -- otherwise every new recording
-        # left on defaults would land in the same Timelapses\recording\
-        # folder and Build Video would mix their frames.
-        self._auto_frames = "" if existing else str(default_frames)
-        self._auto_output = "" if existing else str(default_output)
-        self.name_var.trace_add("write", self._sync_default_dirs)
-
         sched = existing.schedule if existing else Schedule()
         self.schedule_mode_var = tk.StringVar(value=sched.mode)
         mode_frame = ttk.Frame(self)
@@ -679,16 +732,6 @@ class RecordingDialog(tk.Toplevel):
         for w in self._duration_widgets:
             w.configure(state=duration_state)
 
-    def _sync_default_dirs(self, *_args) -> None:
-        name = self.name_var.get().strip()
-        new_frames, new_output = default_setup_dirs(name or "recording")
-        if self.frames_dir_var.get() == self._auto_frames:
-            self._auto_frames = str(new_frames)
-            self.frames_dir_var.set(self._auto_frames)
-        if self.output_dir_var.get() == self._auto_output:
-            self._auto_output = str(new_output)
-            self.output_dir_var.set(self._auto_output)
-
     def _update_interval_estimate(self, *_args) -> None:
         try:
             interval = float(self.interval_var.get())
@@ -703,11 +746,6 @@ class RecordingDialog(tk.Toplevel):
             f"~{frames_per_hour:.0f} frames/hour -> {video_seconds_per_hour:.1f}s of video "
             f"per hour of capture at 30fps"
         )
-
-    def _browse(self, var: tk.StringVar) -> None:
-        path = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
-        if path:
-            var.set(path)
 
     def _open_map(self) -> None:
         LocationMapDialog(self, self.lat_var, self.lon_var)
@@ -744,10 +782,6 @@ class RecordingDialog(tk.Toplevel):
         except ValueError:
             messagebox.showerror("Invalid", "Seconds between frames must be a number greater than 0.")
             return
-
-        default_frames, default_output = default_setup_dirs(name)
-        frames_dir = self.frames_dir_var.get().strip() or str(default_frames)
-        output_dir = self.output_dir_var.get().strip() or str(default_output)
 
         mode = self.schedule_mode_var.get()
         # Parse every schedule field regardless of the active mode so
@@ -790,8 +824,7 @@ class RecordingDialog(tk.Toplevel):
         )
 
         recording = Recording(
-            name=name, camera_name=camera_name, interval=interval,
-            frames_dir=frames_dir, output_dir=output_dir, schedule=schedule,
+            name=name, camera_name=camera_name, interval=interval, schedule=schedule,
         )
         self.config.put_recording(recording)
         self.config.save()
