@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "reolink-timelapse"
-version = "0.2.0"
+version = "0.2.1"
 description = "Record and build timelapses from RTSP cameras, across any number of camera setups"
 requires-python = ">=3.9"
 dependencies = [
