@@ -187,6 +187,21 @@ class App:
             return
         self.log(f"Stopping '{name}'...")
         self.running[name].stop_event.set()
+        self._poll_stop_then_offer_build(name)
+
+    def _poll_stop_then_offer_build(self, name: str) -> None:
+        rc = self.running.get(name)
+        if rc is not None and rc.thread.is_alive():
+            self.root.after(300, self._poll_stop_then_offer_build, name)
+            return
+        setup = self.config.setups.get(name)
+        if setup is None:
+            return
+        if messagebox.askyesno(
+            "Build video?",
+            f"Capture for '{name}' has stopped. Build a video from the captured frames now?",
+        ):
+            BuildDialog(self.root, setup, self.log)
 
     # ---- build ----
 
