@@ -29,7 +29,7 @@ def build_timelapse(
     start_date: Optional[dt.date] = None,
     end_date: Optional[dt.date] = None,
 ) -> str:
-    check_ffmpeg()
+    ffmpeg_bin = check_ffmpeg()
     frames_dir = setup.frames_dir
     if not os.path.isdir(frames_dir):
         sys.exit(f"ERROR: frames directory '{frames_dir}' does not exist.")
@@ -61,7 +61,7 @@ def build_timelapse(
             f.write(f"file '{escaped}'\n")
 
     cmd = [
-        "ffmpeg", "-y",
+        ffmpeg_bin, "-y",
         "-f", "concat", "-safe", "0",
         "-r", str(output_fps),
         "-i", list_path,

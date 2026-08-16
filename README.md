@@ -11,7 +11,32 @@ config-driven install rather than a one-off script per camera.
 - Python 3.9+
 - [ffmpeg](https://www.gyan.dev/ffmpeg/builds/) on your PATH (`ffmpeg -version` should work)
 
-## Install
+...or skip both and use the standalone Windows .exe build below, which bundles
+its own Python and ffmpeg.
+
+## Standalone .exe (Windows)
+
+`dist\reolink-timelapse\reolink-timelapse.exe` is a self-contained build —
+Python and ffmpeg are both bundled inside the `dist\reolink-timelapse\`
+folder, so it runs with nothing else installed. Build it yourself:
+
+```powershell
+.\build_exe.ps1
+```
+
+(needs ffmpeg on PATH *at build time only*, to copy into the bundle — the
+resulting exe doesn't need it afterward). This produces `dist\reolink-timelapse\`,
+which is the whole distributable — zip that folder up and it'll run anywhere.
+
+Usage is identical to the Python CLI below, just swap the command:
+
+```powershell
+.\dist\reolink-timelapse\reolink-timelapse.exe configure backyard
+.\dist\reolink-timelapse\reolink-timelapse.exe run backyard
+.\dist\reolink-timelapse\reolink-timelapse.exe build backyard --output-fps 24
+```
+
+## Install (from source)
 
 ```bash
 pip install -r requirements.txt
