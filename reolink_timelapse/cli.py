@@ -252,6 +252,26 @@ def cmd_run(args: argparse.Namespace) -> None:
     run_scheduled(setup)
 
 
+def cmd_live(args: argparse.Namespace) -> None:
+    import threading
+
+    from .live import run_live
+
+    config = _open_config()
+    camera = config.get_camera(args.camera)
+    stop_event = threading.Event()
+    worker = threading.Thread(target=run_live, args=(camera, stop_event), daemon=True)
+    worker.start()
+    print("Live timelapse running -- press Ctrl+C to stop.")
+    try:
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nStopping live timelapse (finishing the current chunk)...")
+        stop_event.set()
+        worker.join()
+
+
 def cmd_build(args: argparse.Namespace) -> None:
     config = _open_config()
     setup = config.resolved(args.name)
@@ -307,6 +327,11 @@ def main() -> None:
     p = sub.add_parser("run", help="Start capturing frames for a recording (long-running)")
     p.add_argument("name")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("live", help="Run a rolling near-live timelapse for a camera "
+                                     "(updates last_hour.mp4 and session.mp4 every ~5 min)")
+    p.add_argument("--camera", required=True, help="Name of a configured camera")
+    p.set_defaults(func=cmd_live)
 
     p = sub.add_parser("gui", help="Launch the graphical control panel")
     p.set_defaults(func=cmd_gui)

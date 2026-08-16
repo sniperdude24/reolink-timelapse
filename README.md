@@ -187,6 +187,34 @@ fast-moving objects can shimmer slightly where frames are synthesized.
 Automatic end-of-session builds stay plain; smoothing is a per-build
 choice.
 
+## Live rolling timelapse
+
+The **Live Timelapse** panel (bottom-right of the GUI) maintains a
+near-livestream timelapse, independent of scheduled recordings: pick a
+camera and press Start. The camera's stream is saved in 5-minute video
+chunks (a stream copy — near-zero CPU while capturing), and as each chunk
+completes it's folded into two always-current videos, at 60x speed
+(5 minutes of real time plays in ~5 seconds):
+
+- **`last_hour.mp4`** — the trailing hour, playing in about a minute; the
+  oldest 5 minutes falls off as each new chunk arrives.
+- **`session.mp4`** — everything since you pressed Start, growing as the
+  session runs.
+
+Both live under `Timelapses\Live\<camera>\` and update atomically every
+~5 minutes — the view lags real time by at most one chunk; just re-open
+the file (Play Last Hour / Play Session buttons) to see the latest. From
+the CLI:
+
+```bash
+python -m reolink_timelapse live --camera backyard
+```
+
+The raw full-speed chunks are **kept** in `Timelapses\Live\<camera>\chunks\`
+as a full video archive — on a 4K main stream that's roughly **4 GB per
+hour** (~90 GB per day), so keep an eye on disk if you leave it running
+long-term (the log line reports the accumulated size after every chunk).
+
 ## Sessions, folders, and videos
 
 Every continuous start-to-stop capture run is a **session** — one recurring

@@ -18,6 +18,7 @@ import tzlocal
 
 from .build import build_timelapse
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
+from .live import live_dirs, run_live
 from .scheduler import daylight_window, next_window, run_scheduled
 
 _TIMEZONES = sorted(available_timezones())
@@ -80,6 +81,8 @@ class App:
 
         self.config = Config()
         self.running: dict[str, RunningCapture] = {}
+        self.live_worker: Optional[RunningCapture] = None
+        self.live_state: dict = {}
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._closed = False
         self._closing = False
@@ -105,10 +108,13 @@ class App:
         left = ttk.Frame(content)
         left.pack(side="left", fill="both", expand=True)
 
-        videos_frame = ttk.LabelFrame(content, text="Latest Videos")
-        videos_frame.pack(side="right", fill="y", padx=(4, 8), pady=8)
+        right = ttk.Frame(content)
+        right.pack(side="right", fill="y", padx=(4, 8), pady=8)
+
+        videos_frame = ttk.LabelFrame(right, text="Latest Videos")
+        videos_frame.pack(fill="both", expand=True)
         self.videos_tree = ttk.Treeview(
-            videos_frame, columns=("recording", "created"), show="tree headings", height=22
+            videos_frame, columns=("recording", "created"), show="tree headings", height=15
         )
         self.videos_tree.heading("#0", text="Video")
         self.videos_tree.heading("recording", text="Recording")
@@ -122,6 +128,31 @@ class App:
         videos_toolbar.pack(fill="x", padx=4, pady=(2, 4))
         ttk.Button(videos_toolbar, text="Play", command=self.on_play_video).pack(side="left", padx=2)
         ttk.Button(videos_toolbar, text="Show in Folder", command=self.on_show_video_folder).pack(side="left", padx=2)
+
+        live_frame = ttk.LabelFrame(right, text="Live Timelapse")
+        live_frame.pack(fill="x", pady=(8, 0))
+        live_top = ttk.Frame(live_frame)
+        live_top.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(live_top, text="Camera:").pack(side="left")
+        self.live_camera_var = tk.StringVar(value=self.config.live_camera or "")
+        self.live_camera_combo = ttk.Combobox(
+            live_top, textvariable=self.live_camera_var, state="readonly",
+            values=sorted(self.config.cameras), width=16,
+        )
+        self.live_camera_combo.pack(side="left", padx=4)
+        live_buttons = ttk.Frame(live_frame)
+        live_buttons.pack(fill="x", padx=4, pady=2)
+        ttk.Button(live_buttons, text="Start", command=self.on_live_start).pack(side="left", padx=2)
+        ttk.Button(live_buttons, text="Stop", command=self.on_live_stop).pack(side="left", padx=2)
+        live_play = ttk.Frame(live_frame)
+        live_play.pack(fill="x", padx=4, pady=2)
+        ttk.Button(live_play, text="Play Last Hour",
+                   command=lambda: self.on_play_live("last_hour.mp4")).pack(side="left", padx=2)
+        ttk.Button(live_play, text="Play Session",
+                   command=lambda: self.on_play_live("session.mp4")).pack(side="left", padx=2)
+        self.live_status_var = tk.StringVar(value="Off")
+        ttk.Label(live_frame, textvariable=self.live_status_var, foreground="gray").pack(
+            anchor="w", padx=6, pady=(2, 4))
 
         cameras_frame = ttk.LabelFrame(left, text="Added Cameras")
         cameras_frame.pack(fill="x", padx=8, pady=(8, 4))
@@ -194,6 +225,7 @@ class App:
         self._refresh_camera_tree()
         self._refresh_recording_tree()
         self._refresh_videos_tree()
+        self.live_camera_combo.configure(values=sorted(self.config.cameras))
 
     def _scan_latest_videos(self) -> list:
         """[(mtime, path, recording_name)] for the newest ~20 built videos
@@ -320,6 +352,7 @@ class App:
                 if recording:
                     self.recording_tree.set(iid, "window", self._window_label(recording))
         self._refresh_videos_tree()
+        self._update_live_status()
         self.root.after(1000, self._refresh_status_loop)
 
     def _tree_selection(self, tree: ttk.Treeview) -> Optional[str]:
@@ -478,26 +511,101 @@ class App:
         os.makedirs(recording.output_dir, exist_ok=True)
         os.startfile(recording.output_dir)  # Windows only, matches this project's target platform
 
+    # ---- live timelapse ----
+
+    def _live_running(self) -> bool:
+        return self.live_worker is not None and self.live_worker.thread.is_alive()
+
+    def on_live_start(self) -> None:
+        if self._live_running():
+            return
+        name = self.live_camera_var.get()
+        if not name or name not in self.config.cameras:
+            messagebox.showinfo("Live Timelapse", "Select a camera first.")
+            return
+        camera = self.config.cameras[name]
+        self.config.live_camera = name
+        self.config.save()
+
+        def status_cb(chunks: int, raw_gb: float) -> None:
+            # worker thread -> whole-dict swap; the status loop only reads
+            self.live_state = {"chunks": chunks, "gb": raw_gb, "updated": dt.datetime.now()}
+
+        stop_event = threading.Event()
+        thread = threading.Thread(
+            target=self._live_worker_fn, args=(camera, stop_event, status_cb), daemon=True
+        )
+        self.live_worker = RunningCapture(thread, stop_event)
+        self.live_state = {}
+        thread.start()
+        self._update_live_status()
+
+    def _live_worker_fn(self, camera, stop_event, status_cb) -> None:
+        try:
+            run_live(camera, stop_event, log=self.log, status=status_cb)
+        except SystemExit as e:
+            self.log(f"Live timelapse stopped: {e}")
+        except Exception as e:
+            self.log(f"Live timelapse crashed: {e}")
+
+    def on_live_stop(self) -> None:
+        if not self._live_running():
+            messagebox.showinfo("Live Timelapse", "The live timelapse isn't running.")
+            return
+        self.log("Stopping live timelapse (finishing the current chunk)...")
+        self.live_worker.stop_event.set()
+
+    def on_play_live(self, filename: str) -> None:
+        name = self.live_camera_var.get()
+        if not name:
+            messagebox.showinfo("Live Timelapse", "Select a camera first.")
+            return
+        path = live_dirs(name)[2] / filename
+        if not path.exists():
+            messagebox.showinfo(
+                "Live Timelapse",
+                "No live video yet -- start the live timelapse and wait for the first chunk.",
+            )
+            return
+        os.startfile(str(path))  # Windows only, same convention as Latest Videos
+
+    def _update_live_status(self) -> None:
+        if self._live_running():
+            st = self.live_state
+            if st.get("updated"):
+                text = (f"Live -- updated {st['updated']:%H:%M:%S}, "
+                        f"{st['chunks']} chunks, {st['gb']:.1f} GB raw video")
+            else:
+                text = "Live -- waiting for the first chunk..."
+        else:
+            text = "Off"
+        if self.live_status_var.get() != text:
+            self.live_status_var.set(text)
+
     # ---- shutdown ----
 
     def on_close(self) -> None:
         if self._closing:
             return
-        if self.running:
+        workers = list(self.running.values())
+        if self._live_running():
+            workers.append(self.live_worker)
+        if workers:
             if not messagebox.askyesno(
-                "Quit", f"{len(self.running)} recording(s) still capturing. Stop them and quit?"
+                "Quit", f"{len(workers)} capture(s) still running. Stop them and quit?"
             ):
                 return
             self._closing = True
             self.root.title("Reolink Timelapse - finishing video builds...")
-            for rc in self.running.values():
+            for rc in workers:
                 rc.stop_event.set()
-            # Each worker stops ffmpeg and then builds its session's video,
-            # which can take minutes -- a fixed join timeout here would kill
-            # those builds mid-write (daemon threads die with the app). Wait
-            # them out instead, pumping the UI so log lines stay visible.
-            while any(rc.thread.is_alive() for rc in self.running.values()):
-                for rc in list(self.running.values()):
+            # Each worker stops ffmpeg and then builds its session's video
+            # (or converts the final live chunk), which can take minutes -- a
+            # fixed join timeout here would kill that work mid-write (daemon
+            # threads die with the app). Wait them out instead, pumping the
+            # UI so log lines stay visible.
+            while any(rc.thread.is_alive() for rc in workers):
+                for rc in workers:
                     rc.thread.join(timeout=0.2)
                 try:
                     self.root.update()

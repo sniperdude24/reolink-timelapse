@@ -175,6 +175,7 @@ class Config:
         self.path = path or default_config_path()
         self.cameras: dict[str, Camera] = {}
         self.recordings: dict[str, Recording] = {}
+        self.live_camera: Optional[str] = None  # camera the Live Timelapse panel uses
         self.migrated_from: Optional[Path] = None
         self.migration_error: Optional[str] = None
         self.schema_migrated = False
@@ -197,6 +198,7 @@ class Config:
             name: Recording.from_dict(name, data)
             for name, data in (raw.get("recordings") or {}).items()
         }
+        self.live_camera = (raw.get("live") or {}).get("camera_name")
         if self.schema_migrated:
             self.save()
 
@@ -248,6 +250,8 @@ class Config:
             "cameras": {name: c.to_dict() for name, c in self.cameras.items()},
             "recordings": {name: r.to_dict() for name, r in self.recordings.items()},
         }
+        if self.live_camera:
+            raw["live"] = {"camera_name": self.live_camera}
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         if sys.platform != "win32":
