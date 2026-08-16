@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 import sys
 from typing import Optional
 from urllib.parse import quote
@@ -35,6 +36,23 @@ def check_ffmpeg() -> str:
             "Windows builds: https://www.gyan.dev/ffmpeg/builds/"
         )
     return path
+
+
+def no_console_kwargs() -> dict:
+    """subprocess kwargs that stop ffmpeg from popping up a console window
+    when spawned from a process that has none of its own (the windowed GUI
+    build). Skipped when the current process already has a real console
+    (the CLI): there's no popup to prevent there, and CREATE_NO_WINDOW would
+    give the child its own new *hidden* console instead of sharing the
+    parent's visible one -- silently swallowing ffmpeg's live output rather
+    than just hiding a window, discovered while testing this.
+    """
+    if sys.platform != "win32":
+        return {}
+    import ctypes
+    if ctypes.windll.kernel32.GetConsoleWindow():
+        return {}
+    return {"creationflags": subprocess.CREATE_NO_WINDOW}
 
 
 def build_rtsp_url(setup: Setup) -> str:

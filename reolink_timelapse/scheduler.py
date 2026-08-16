@@ -63,7 +63,7 @@ def _now(setup: Setup) -> dt.datetime:
     return dt.datetime.now().astimezone()
 
 
-def _next_window(setup: Setup) -> Window:
+def next_window(setup: Setup) -> Window:
     now = _now(setup)
     window = daylight_window(setup, now.date())
     if now >= window.end:
@@ -145,7 +145,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
     try:
         while not stop_event.is_set():
             if setup.schedule.mode == "daylight":
-                window = _next_window(setup)
+                window = next_window(setup)
                 if _sleep_until(window.start, setup, log, stop_event):
                     break
                 window_end = window.end

@@ -14,7 +14,7 @@ from typing import Optional
 
 from .build import build_timelapse
 from .config import Config, Schedule, Setup, default_setup_dirs, is_valid_timezone
-from .scheduler import run_scheduled
+from .scheduler import next_window, run_scheduled
 
 
 def _parse_optional_float(raw: str) -> Optional[float]:
@@ -35,6 +35,10 @@ def _parse_optional_int(raw: str, default: int = 0) -> int:
         return int(raw)
     except ValueError:
         return default
+
+
+def _fmt_time(t: dt.datetime) -> str:
+    return t.strftime("%I:%M %p").lstrip("0")
 
 
 @dataclass
@@ -60,62 +64,112 @@ class App:
             self.log(f"Migrated existing config from {self.config.migrated_from} to {self.config.path}.")
         if self.config.migration_error:
             self.log(f"WARNING: {self.config.migration_error}")
-        self.refresh_list()
+        self.refresh_lists()
         self.root.after(200, self._drain_log_queue)
         self.root.after(1000, self._refresh_status_loop)
 
     # ---- layout ----
 
     def _build_widgets(self) -> None:
-        toolbar = ttk.Frame(self.root)
-        toolbar.pack(fill="x", padx=8, pady=6)
-        ttk.Button(toolbar, text="Add Setup", command=self.on_add).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Edit", command=self.on_edit).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Remove", command=self.on_remove).pack(side="left", padx=2)
-        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(toolbar, text="Start", command=self.on_start).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Stop", command=self.on_stop).pack(side="left", padx=2)
-        ttk.Separator(toolbar, orient="vertical").pack(side="left", fill="y", padx=6)
-        ttk.Button(toolbar, text="Build Video...", command=self.on_build).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Open Folder", command=self.on_open_folder).pack(side="left", padx=2)
+        cameras_frame = ttk.LabelFrame(self.root, text="Added Cameras")
+        cameras_frame.pack(fill="x", padx=8, pady=(8, 4))
 
-        columns = ("ip", "stream", "schedule", "status")
-        self.tree = ttk.Treeview(self.root, columns=columns, show="tree headings", height=8)
-        self.tree.heading("#0", text="Setup")
-        self.tree.heading("ip", text="Camera")
-        self.tree.heading("stream", text="Stream")
-        self.tree.heading("schedule", text="Schedule")
-        self.tree.heading("status", text="Status")
-        self.tree.column("#0", width=130)
-        self.tree.column("ip", width=170)
-        self.tree.column("stream", width=90)
-        self.tree.column("schedule", width=110)
-        self.tree.column("status", width=110)
-        self.tree.pack(fill="x", padx=8, pady=(0, 6))
+        cameras_toolbar = ttk.Frame(cameras_frame)
+        cameras_toolbar.pack(fill="x", padx=4, pady=4)
+        ttk.Button(cameras_toolbar, text="Add Setup", command=self.on_add).pack(side="left", padx=2)
+        ttk.Button(cameras_toolbar, text="Edit", command=self.on_edit).pack(side="left", padx=2)
+        ttk.Button(cameras_toolbar, text="Remove", command=self.on_remove).pack(side="left", padx=2)
+
+        self.camera_tree = ttk.Treeview(
+            cameras_frame, columns=("camera", "channel", "stream"), show="tree headings", height=5
+        )
+        self.camera_tree.heading("#0", text="Setup")
+        self.camera_tree.heading("camera", text="Camera")
+        self.camera_tree.heading("channel", text="Channel")
+        self.camera_tree.heading("stream", text="Stream")
+        self.camera_tree.column("#0", width=130)
+        self.camera_tree.column("camera", width=170)
+        self.camera_tree.column("channel", width=80)
+        self.camera_tree.column("stream", width=90)
+        self.camera_tree.pack(fill="x", padx=4, pady=(0, 4))
+
+        recordings_frame = ttk.LabelFrame(self.root, text="Scheduled Recordings")
+        recordings_frame.pack(fill="x", padx=8, pady=(4, 4))
+
+        recordings_toolbar = ttk.Frame(recordings_frame)
+        recordings_toolbar.pack(fill="x", padx=4, pady=4)
+        ttk.Button(recordings_toolbar, text="Start", command=self.on_start).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar, text="Stop", command=self.on_stop).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar, text="Build Video...", command=self.on_build).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar, text="Open Folder", command=self.on_open_folder).pack(side="left", padx=2)
+
+        self.recording_tree = ttk.Treeview(
+            recordings_frame, columns=("mode", "window", "status"), show="tree headings", height=5
+        )
+        self.recording_tree.heading("#0", text="Setup")
+        self.recording_tree.heading("mode", text="Schedule")
+        self.recording_tree.heading("window", text="Window")
+        self.recording_tree.heading("status", text="Status")
+        self.recording_tree.column("#0", width=130)
+        self.recording_tree.column("mode", width=90)
+        self.recording_tree.column("window", width=260)
+        self.recording_tree.column("status", width=90)
+        self.recording_tree.pack(fill="x", padx=4, pady=(0, 4))
 
         log_frame = ttk.LabelFrame(self.root, text="Log")
-        log_frame.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        log_frame.pack(fill="both", expand=True, padx=8, pady=(4, 8))
         self.log_text = tk.Text(log_frame, height=16, state="disabled", wrap="word")
         scrollbar = ttk.Scrollbar(log_frame, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=scrollbar.set)
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-    # ---- setup list ----
+    # ---- setup lists ----
 
-    def refresh_list(self) -> None:
-        selected = self.selected_name()
-        self.tree.delete(*self.tree.get_children())
+    def refresh_lists(self) -> None:
+        self._refresh_camera_tree()
+        self._refresh_recording_tree()
+
+    def _refresh_camera_tree(self) -> None:
+        selected = self._tree_selection(self.camera_tree)
+        self.camera_tree.delete(*self.camera_tree.get_children())
+        for name, s in sorted(self.config.setups.items()):
+            self.camera_tree.insert("", "end", iid=name, text=name, values=(
+                f"{s.ip}:{s.port}",
+                s.channel,
+                "sub" if s.substream else "main",
+            ))
+        if selected and self.camera_tree.exists(selected):
+            self.camera_tree.selection_set(selected)
+
+    def _refresh_recording_tree(self) -> None:
+        selected = self._tree_selection(self.recording_tree)
+        self.recording_tree.delete(*self.recording_tree.get_children())
         for name, s in sorted(self.config.setups.items()):
             status = "Running" if name in self.running else "Stopped"
-            self.tree.insert("", "end", iid=name, text=name, values=(
-                f"{s.ip}:{s.port}",
-                "sub" if s.substream else "main",
+            self.recording_tree.insert("", "end", iid=name, text=name, values=(
                 s.schedule.mode,
+                self._window_label(s),
                 status,
             ))
-        if selected and self.tree.exists(selected):
-            self.tree.selection_set(selected)
+        if selected and self.recording_tree.exists(selected):
+            self.recording_tree.selection_set(selected)
+
+    def _window_label(self, s: Setup) -> str:
+        if s.schedule.mode != "daylight":
+            return "Continuous"
+        try:
+            window = next_window(s)
+        except Exception:
+            return "(check location settings)"
+        now = dt.datetime.now(window.start.tzinfo)
+        if window.start.date() == now.date():
+            day_label = "Today"
+        elif window.start.date() == now.date() + dt.timedelta(days=1):
+            day_label = "Tomorrow"
+        else:
+            day_label = window.start.strftime("%b %d")
+        return f"{day_label} {_fmt_time(window.start)}-{_fmt_time(window.end)}"
 
     def _refresh_status_loop(self) -> None:
         if self._closed:
@@ -123,15 +177,19 @@ class App:
         for name in list(self.running):
             if not self.running[name].thread.is_alive():
                 del self.running[name]
-        self.refresh_list()
+        self.refresh_lists()
         self.root.after(1000, self._refresh_status_loop)
 
-    def selected_name(self) -> Optional[str]:
-        sel = self.tree.selection()
+    def _tree_selection(self, tree: ttk.Treeview) -> Optional[str]:
+        sel = tree.selection()
         return sel[0] if sel else None
 
-    def selected_setup(self) -> Optional[Setup]:
-        name = self.selected_name()
+    def selected_camera(self) -> Optional[Setup]:
+        name = self._tree_selection(self.camera_tree)
+        return self.config.setups.get(name) if name else None
+
+    def selected_recording(self) -> Optional[Setup]:
+        name = self._tree_selection(self.recording_tree)
         return self.config.setups.get(name) if name else None
 
     # ---- logging (thread-safe: workers push, only the main thread touches the widget) ----
@@ -156,19 +214,19 @@ class App:
     # ---- setup actions ----
 
     def on_add(self) -> None:
-        SetupDialog(self.root, self.config, None, self.refresh_list)
+        SetupDialog(self.root, self.config, None, self.refresh_lists)
 
     def on_edit(self) -> None:
-        setup = self.selected_setup()
+        setup = self.selected_camera()
         if not setup:
-            messagebox.showinfo("Edit Setup", "Select a setup first.")
+            messagebox.showinfo("Edit Setup", "Select a camera first.")
             return
-        SetupDialog(self.root, self.config, setup, self.refresh_list)
+        SetupDialog(self.root, self.config, setup, self.refresh_lists)
 
     def on_remove(self) -> None:
-        name = self.selected_name()
+        name = self._tree_selection(self.camera_tree)
         if not name:
-            messagebox.showinfo("Remove Setup", "Select a setup first.")
+            messagebox.showinfo("Remove Setup", "Select a camera first.")
             return
         if name in self.running:
             messagebox.showwarning("Remove Setup", f"Stop '{name}' before removing it.")
@@ -177,14 +235,14 @@ class App:
             return
         self.config.remove(name)
         self.config.save()
-        self.refresh_list()
+        self.refresh_lists()
 
     # ---- capture control ----
 
     def on_start(self) -> None:
-        setup = self.selected_setup()
+        setup = self.selected_recording()
         if not setup:
-            messagebox.showinfo("Start Capture", "Select a setup first.")
+            messagebox.showinfo("Start Capture", "Select a recording first.")
             return
         if setup.name in self.running:
             return
@@ -194,7 +252,7 @@ class App:
         )
         self.running[setup.name] = RunningCapture(thread, stop_event)
         thread.start()
-        self.refresh_list()
+        self.refresh_lists()
 
     def _run_worker(self, setup: Setup, stop_event: threading.Event) -> None:
         try:
@@ -205,9 +263,9 @@ class App:
             self.log(f"'{setup.name}' crashed: {e}")
 
     def on_stop(self) -> None:
-        name = self.selected_name()
+        name = self._tree_selection(self.recording_tree)
         if not name or name not in self.running:
-            messagebox.showinfo("Stop Capture", "That setup isn't running.")
+            messagebox.showinfo("Stop Capture", "That recording isn't running.")
             return
         self.log(f"Stopping '{name}'...")
         # run_scheduled() itself builds a video from this session's frames
@@ -217,16 +275,16 @@ class App:
     # ---- build ----
 
     def on_build(self) -> None:
-        setup = self.selected_setup()
+        setup = self.selected_recording()
         if not setup:
-            messagebox.showinfo("Build Video", "Select a setup first.")
+            messagebox.showinfo("Build Video", "Select a recording first.")
             return
         BuildDialog(self.root, setup, self.log)
 
     def on_open_folder(self) -> None:
-        setup = self.selected_setup()
+        setup = self.selected_recording()
         if not setup:
-            messagebox.showinfo("Open Folder", "Select a setup first.")
+            messagebox.showinfo("Open Folder", "Select a recording first.")
             return
         os.makedirs(setup.output_dir, exist_ok=True)
         os.startfile(setup.output_dir)  # Windows only, matches this project's target platform

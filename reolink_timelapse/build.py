@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from .config import Setup
-from .rtsp import check_ffmpeg
+from .rtsp import check_ffmpeg, no_console_kwargs
 
 FRAME_STEM_LEN = len("20260815_143000")  # YYYYMMDD_HHMMSS
 
@@ -87,7 +87,7 @@ def build_timelapse(
 
     print(f"Building timelapse at {output_fps} fps from {len(frame_paths)} frames...")
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, **no_console_kwargs())
     except subprocess.CalledProcessError as e:
         sys.exit(f"ffmpeg exited with an error (code {e.returncode}) while building the video.")
     finally:

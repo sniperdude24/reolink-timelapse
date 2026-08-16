@@ -6,7 +6,7 @@ import os
 import subprocess
 
 from .config import Setup
-from .rtsp import build_rtsp_url, check_ffmpeg
+from .rtsp import build_rtsp_url, check_ffmpeg, no_console_kwargs
 
 
 def start_capture_process(setup: Setup, session_dir: str) -> subprocess.Popen:
@@ -27,7 +27,7 @@ def start_capture_process(setup: Setup, session_dir: str) -> subprocess.Popen:
         out_pattern,
     ]
     return subprocess.Popen(
-        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True
+        cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, **no_console_kwargs()
     )
 
 
