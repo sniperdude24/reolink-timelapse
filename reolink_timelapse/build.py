@@ -79,6 +79,7 @@ def build_timelapse(
         "-f", "concat", "-safe", "0",
         "-r", str(output_fps),
         "-i", list_path,
+        "-vf", "deflicker",
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         output_file,
