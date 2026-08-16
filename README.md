@@ -115,14 +115,32 @@ window it sleeps until the next window start, and if ffmpeg exits
 unexpectedly mid-window (camera reboot, network blip) it waits 30s and
 retries automatically rather than giving up.
 
+## Sessions, folders, and videos
+
+Every continuous start-to-stop capture run is a **session** — one daylight
+window, or one manual start/stop in "always" mode. Each session gets its own
+subfolder under `frames_dir`, named from its start time plus a short random
+suffix (e.g. `20260816_064712_a1b2`), so two sessions can never collide —
+including two instances of the same setup started at the same time.
+
+A video is **built automatically right after each session ends** — window
+close, manual stop, or Ctrl+C — named `<setup>_<date>_<start>-<end>.mp4`
+(24-hour clock, e.g. `backyard_2026-08-16_06h47-20h54.mp4`) and written to
+`output_dir`, which stays a single flat folder shared by every session's
+video — only the frames get split up, not the finished videos. `build
+<name>` (or the GUI's "Build Video...") still works too, and aggregates
+frames across *all* of a setup's sessions (plus any frames captured before
+per-session folders existed) unless you filter by date.
+
 ## Where things are stored
 
 - **Config** (camera credentials, per-setup schedule) lives in your OS user
   config dir — `%APPDATA%\reolink-timelapse\config.yaml` on Windows,
   `~/.config/reolink-timelapse/config.yaml` elsewhere — not inside this repo,
   so it's never at risk of being committed.
-- **Frames and finished videos** default to `~/Timelapses/<setup-name>/`,
-  configurable per setup during `configure`.
+- **Frames** default to `~/Timelapses/<setup-name>/frames/<session>/`, and
+  **finished videos** to `~/Timelapses/<setup-name>/`, both configurable per
+  setup during `configure`.
 
 ## Notes / known limitations
 

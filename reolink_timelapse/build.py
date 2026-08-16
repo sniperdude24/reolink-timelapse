@@ -6,7 +6,8 @@ import datetime as dt
 import os
 import subprocess
 import sys
-from typing import Optional
+from pathlib import Path
+from typing import List, Optional
 
 from .config import Setup
 from .rtsp import check_ffmpeg
@@ -22,27 +23,40 @@ def _frame_date(filename: str) -> Optional[dt.date]:
         return None
 
 
+def _collect_frames(frames_dir: str) -> List[Path]:
+    # Frames live one level down, in a per-session subfolder
+    # (frames_dir/<session>/*.jpg). Also match frames directly in
+    # frames_dir for backward compatibility with captures made before
+    # per-session folders existed. Sorting by filename (not full path)
+    # keeps chronological order regardless of which session a frame is in,
+    # since the timestamp is encoded in the filename itself.
+    root = Path(frames_dir)
+    frames = list(root.glob("*/*.jpg")) + list(root.glob("*.jpg"))
+    return sorted(frames, key=lambda p: p.name)
+
+
 def build_timelapse(
     setup: Setup,
     output_fps: float = 30,
     output_file: Optional[str] = None,
     start_date: Optional[dt.date] = None,
     end_date: Optional[dt.date] = None,
+    frames_dir: Optional[str] = None,
 ) -> str:
     ffmpeg_bin = check_ffmpeg()
-    frames_dir = setup.frames_dir
+    frames_dir = frames_dir or setup.frames_dir
     if not os.path.isdir(frames_dir):
         sys.exit(f"ERROR: frames directory '{frames_dir}' does not exist.")
 
-    frame_files = sorted(f for f in os.listdir(frames_dir) if f.lower().endswith(".jpg"))
+    frame_paths = _collect_frames(frames_dir)
     if start_date or end_date:
-        frame_files = [
-            f for f in frame_files
-            if (d := _frame_date(f)) is not None
+        frame_paths = [
+            p for p in frame_paths
+            if (d := _frame_date(p.name)) is not None
             and (start_date is None or d >= start_date)
             and (end_date is None or d <= end_date)
         ]
-    if not frame_files:
+    if not frame_paths:
         sys.exit(f"ERROR: no matching .jpg frames found in '{frames_dir}'.")
 
     os.makedirs(setup.output_dir, exist_ok=True)
@@ -55,8 +69,8 @@ def build_timelapse(
     # with "Pattern type 'glob' is not available".
     list_path = os.path.join(frames_dir, "_timelapse_concat_list.txt")
     with open(list_path, "w", encoding="utf-8") as f:
-        for name in frame_files:
-            abs_path = os.path.abspath(os.path.join(frames_dir, name))
+        for p in frame_paths:
+            abs_path = str(p.resolve())
             escaped = abs_path.replace("'", "'\\''")
             f.write(f"file '{escaped}'\n")
 
@@ -70,7 +84,7 @@ def build_timelapse(
         output_file,
     ]
 
-    print(f"Building timelapse at {output_fps} fps from {len(frame_files)} frames...")
+    print(f"Building timelapse at {output_fps} fps from {len(frame_paths)} frames...")
     try:
         subprocess.run(cmd, check=True)
     except subprocess.CalledProcessError as e:

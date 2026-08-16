@@ -9,12 +9,12 @@ from .config import Setup
 from .rtsp import build_rtsp_url, check_ffmpeg
 
 
-def start_capture_process(setup: Setup) -> subprocess.Popen:
+def start_capture_process(setup: Setup, session_dir: str) -> subprocess.Popen:
     ffmpeg_bin = check_ffmpeg()
-    os.makedirs(setup.frames_dir, exist_ok=True)
+    os.makedirs(session_dir, exist_ok=True)
     rtsp_url = build_rtsp_url(setup)
     fps_filter = f"fps=1/{setup.interval}"
-    out_pattern = os.path.join(setup.frames_dir, "%Y%m%d_%H%M%S.jpg")
+    out_pattern = os.path.join(session_dir, "%Y%m%d_%H%M%S.jpg")
 
     cmd = [
         ffmpeg_bin,

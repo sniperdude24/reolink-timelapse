@@ -9,20 +9,31 @@ Every wait in here is chunked against a threading.Event rather than one long
 blocking sleep, so a caller (the GUI, running this in a background thread)
 can request a clean stop without waiting out an entire daylight window --
 and so ffmpeg always gets terminated properly rather than orphaned.
+
+Each continuous start-to-stop capture run (one daylight window, or one
+manual start/stop in "always" mode) is a "session": its frames go into
+their own subfolder under frames_dir, named from the session's start time
+plus a short random suffix so two sessions can never collide -- including
+two instances of the same setup started at once. A video is built
+automatically from each session's frames right after it ends.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
+import secrets
 import subprocess
 import threading
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from astral import LocationInfo
 from astral.sun import sun
 from zoneinfo import ZoneInfo
 
+from .build import build_timelapse
 from .capture import start_capture_process, stop_capture_process
 from .config import Setup
 
@@ -96,6 +107,32 @@ def _wait_capture(proc, window_end, setup: Setup, stop_event: threading.Event) -
             continue
 
 
+def _new_session_dir(setup: Setup, start: dt.datetime) -> str:
+    session_id = f"{start:%Y%m%d_%H%M%S}_{secrets.token_hex(2)}"
+    return os.path.join(setup.frames_dir, session_id)
+
+
+def _format_time_label(t: dt.datetime) -> str:
+    return t.strftime("%Hh%M")
+
+
+def _auto_build_session(
+    setup: Setup, session_dir: str, start: dt.datetime, end: dt.datetime, log
+) -> None:
+    if not any(Path(session_dir).glob("*.jpg")):
+        log(f"No frames captured for '{setup.name}' this session -- skipping video build.")
+        return
+    label = f"{_format_time_label(start)}-{_format_time_label(end)}"
+    filename = f"{setup.name}_{start:%Y-%m-%d}_{label}.mp4"
+    output_file = os.path.join(setup.output_dir, filename)
+    log(f"Building video for this session: {filename}")
+    try:
+        out = build_timelapse(setup, frames_dir=session_dir, output_file=output_file)
+        log(f"Video ready: {out}")
+    except (SystemExit, Exception) as e:
+        log(f"Auto-build failed for '{setup.name}': {e}")
+
+
 def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event] = None) -> None:
     stop_event = stop_event or threading.Event()
     log(f"Starting scheduled capture for '{setup.name}' "
@@ -103,6 +140,8 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
     log("Press Ctrl+C to stop.")
 
     proc = None
+    session_dir = None
+    session_start = None
     try:
         while not stop_event.is_set():
             if setup.schedule.mode == "daylight":
@@ -113,10 +152,12 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
             else:
                 window_end = None  # run forever
 
-            log(f"Capturing for '{setup.name}'"
+            session_start = _now(setup)
+            session_dir = _new_session_dir(setup, session_start)
+            log(f"Capturing for '{setup.name}' into session '{os.path.basename(session_dir)}'"
                 + (f" until {window_end.strftime('%H:%M:%S %Z')}" if window_end else "")
                 + "...")
-            proc = start_capture_process(setup)
+            proc = start_capture_process(setup, session_dir)
 
             while True:
                 outcome = _wait_capture(proc, window_end, setup, stop_event)
@@ -129,13 +170,17 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
                         break
                     if window_end is not None and _now(setup) >= window_end:
                         break
-                    proc = start_capture_process(setup)
+                    proc = start_capture_process(setup, session_dir)  # same session, retrying
                     continue
                 break  # "window_end" or "stopped"
 
             log(f"Stopping capture for '{setup.name}' for now.")
             stop_capture_process(proc)
             proc = None
+            session_end = _now(setup)
+            _auto_build_session(setup, session_dir, session_start, session_end, log)
+            session_dir = None
+            session_start = None
 
             if setup.schedule.mode != "daylight" or stop_event.is_set():
                 break
@@ -143,5 +188,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
         log("\nStopped by user.")
         if proc is not None:
             stop_capture_process(proc)
+        if session_dir is not None:
+            _auto_build_session(setup, session_dir, session_start, _now(setup), log)
 
     log(f"Scheduler for '{setup.name}' stopped.")
