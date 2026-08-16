@@ -91,6 +91,8 @@ class Setup:
     interval: float = 30
     frames_dir: str = "frames"
     output_dir: str = "."
+    output_fps: float = 30
+    target_video_seconds: Optional[int] = None
     schedule: Schedule = field(default_factory=Schedule)
 
 
@@ -122,10 +124,18 @@ class Recording:
     Frames and finished videos always live under the program folder's
     Timelapses/<name>/ -- derived from the name, not stored, so every
     install is self-contained and configs can't point at stale locations.
+
+    Capture pacing: interval-paced by default (one frame every `interval`
+    seconds). When `target_video_seconds` is set, the recording is
+    length-paced instead -- the scheduler derives the interval fresh each
+    session from that session's window duration so the finished video
+    comes out the target length at `output_fps`.
     """
     name: str
     camera_name: str
     interval: float = 30
+    output_fps: float = 30
+    target_video_seconds: Optional[int] = None
     schedule: Schedule = field(default_factory=Schedule)
 
     @property
@@ -155,6 +165,7 @@ class Recording:
             name=self.name, ip=camera.ip, user=camera.user, password=camera.password,
             port=camera.port, channel=camera.channel, substream=camera.substream,
             interval=self.interval, frames_dir=self.frames_dir, output_dir=self.output_dir,
+            output_fps=self.output_fps, target_video_seconds=self.target_video_seconds,
             schedule=self.schedule,
         )
 

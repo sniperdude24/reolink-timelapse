@@ -145,6 +145,25 @@ until the next window start, and if ffmpeg exits unexpectedly mid-window
 (camera reboot, network blip) it waits 30s and retries automatically rather
 than giving up.
 
+## Pacing and video length
+
+Each recording has an **output video fps** (default 30) used for its
+automatically built session videos and pre-filled when building manually.
+Capture pacing works one of two ways:
+
+- **Interval between frames** (default): one frame every N seconds. The
+  Add/Edit Recording dialog shows a live estimate of how long the finished
+  video will come out for the current schedule, interval, and fps.
+- **Target video length**: set how long you want the finished video to be
+  (e.g. 60 seconds) and the interval is derived automatically — recomputed
+  at the start of every session from that day's actual window, so daylight
+  videos stay the target length even as sunrise/sunset drift with the
+  seasons. Needs a schedule with a defined session length (Daylight hours,
+  Fixed daily time, or Timer — not Always).
+
+The Build Video dialog also shows the estimated output length for whichever
+session (or the whole history) you've selected at the chosen fps.
+
 ## Sessions, folders, and videos
 
 Every continuous start-to-stop capture run is a **session** — one recurring

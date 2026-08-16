@@ -142,15 +142,42 @@ def cmd_record(args: argparse.Namespace) -> None:
           + (" (editing existing)" if existing else "") + "\n")
 
     while True:
-        interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
-        if interval > 0:
+        output_fps = _prompt("Output video fps", existing.output_fps if existing else 30, float)
+        if output_fps > 0:
             break
-        print("  Interval must be greater than 0.")
+        print("  fps must be greater than 0.")
 
     sched = _prompt_schedule(existing.schedule if existing else None)
 
+    # Pacing: with a bounded schedule the interval can instead be derived
+    # each session from a target video length; "always" has no session
+    # length to divide by, so it stays interval-only.
+    interval = existing.interval if existing else 30
+    target_video_seconds = None
+    pacing = "interval"
+    if sched.mode != "always":
+        default_pacing = "video_length" if (existing and existing.target_video_seconds) else "interval"
+        pacing = _prompt_choice("Set capture by", ["interval", "video_length"], default_pacing)
+    if pacing == "video_length":
+        while True:
+            target_video_seconds = _prompt(
+                "Target video length in seconds",
+                existing.target_video_seconds if (existing and existing.target_video_seconds) else 60,
+                int,
+            )
+            if target_video_seconds > 0:
+                break
+            print("  Length must be greater than 0.")
+    else:
+        while True:
+            interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
+            if interval > 0:
+                break
+            print("  Interval must be greater than 0.")
+
     recording = Recording(
-        name=args.name, camera_name=camera_name, interval=interval, schedule=sched,
+        name=args.name, camera_name=camera_name, interval=interval,
+        output_fps=output_fps, target_video_seconds=target_video_seconds, schedule=sched,
     )
     config.put_recording(recording)
     config.save()

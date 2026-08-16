@@ -17,8 +17,8 @@ from zoneinfo import available_timezones
 import tzlocal
 
 from .build import build_timelapse
-from .config import Camera, Config, Recording, Schedule, is_valid_timezone
-from .scheduler import next_window, run_scheduled
+from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
+from .scheduler import daylight_window, next_window, run_scheduled
 
 _TIMEZONES = sorted(available_timezones())
 
@@ -634,21 +634,43 @@ class RecordingDialog(tk.Toplevel):
         camera_combo = ttk.Combobox(self, textvariable=self.camera_var, state="readonly", values=camera_names)
         add_row("Camera", camera_combo)
 
+        self.fps_var = tk.StringVar(value=f"{existing.output_fps:g}" if existing else "30")
+        add_row("Output video fps", ttk.Entry(self, textvariable=self.fps_var, width=8))
+
+        self.pacing_var = tk.StringVar(
+            value="length" if (existing and existing.target_video_seconds) else "interval"
+        )
+        pacing_frame = ttk.Frame(self)
+        ttk.Radiobutton(pacing_frame, text="Interval between frames", variable=self.pacing_var,
+                         value="interval", command=self._toggle_pacing_fields).pack(anchor="w")
+        ttk.Radiobutton(pacing_frame, text="Target video length (interval auto-adjusts per session)",
+                         variable=self.pacing_var,
+                         value="length", command=self._toggle_pacing_fields).pack(anchor="w")
+        add_row("Set capture by", pacing_frame)
+
         self.interval_var = tk.StringVar(value=str(existing.interval if existing else 30))
-        self.interval_var.trace_add("write", self._update_interval_estimate)
-
         interval_container = ttk.Frame(self)
-        entry_row = ttk.Frame(interval_container)
-        ttk.Entry(entry_row, textvariable=self.interval_var, width=8).pack(side="left")
+        self._interval_widgets = []
+        interval_entry = ttk.Entry(interval_container, textvariable=self.interval_var, width=8)
+        interval_entry.pack(side="left")
+        self._interval_widgets.append(interval_entry)
         for preset_label, seconds in [("5s", 5), ("10s", 10), ("30s", 30), ("1min", 60), ("5min", 300)]:
-            ttk.Button(entry_row, text=preset_label, width=5,
-                       command=lambda s=seconds: self.interval_var.set(str(s))).pack(side="left", padx=2)
-        entry_row.pack(anchor="w")
-
-        self.interval_estimate_var = tk.StringVar(value="")
-        ttk.Label(interval_container, textvariable=self.interval_estimate_var,
-                  foreground="gray").pack(anchor="w", pady=(2, 0))
+            btn = ttk.Button(interval_container, text=preset_label, width=5,
+                             command=lambda s=seconds: self.interval_var.set(str(s)))
+            btn.pack(side="left", padx=2)
+            self._interval_widgets.append(btn)
         add_row("Seconds between frames", interval_container)
+
+        self.target_var = tk.StringVar(
+            value=str(existing.target_video_seconds) if (existing and existing.target_video_seconds) else "60"
+        )
+        self.target_entry = ttk.Entry(self, textvariable=self.target_var, width=8)
+        add_row("Target video length (seconds)", self.target_entry)
+
+        self.estimate_var = tk.StringVar(value="")
+        estimate_label = ttk.Label(self, textvariable=self.estimate_var, foreground="gray")
+        estimate_label.grid(row=self._row, column=0, columnspan=2, sticky="w", padx=6)
+        self._row += 1
 
         sched = existing.schedule if existing else Schedule()
         self.schedule_mode_var = tk.StringVar(value=sched.mode)
@@ -714,8 +736,16 @@ class RecordingDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Save", command=self._save).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
 
+        # Wire the live estimate after every var exists; anything that
+        # changes the math re-renders it.
+        for var in (self.interval_var, self.fps_var, self.target_var,
+                    self.start_time_var, self.end_time_var, self.duration_var,
+                    self.lat_var, self.lon_var, self.tz_var,
+                    self.pre_offset_var, self.post_offset_var):
+            var.trace_add("write", self._update_estimate)
+
         self._toggle_schedule_fields()
-        self._update_interval_estimate()
+        self._toggle_pacing_fields()
 
     def _toggle_schedule_fields(self) -> None:
         mode = self.schedule_mode_var.get()
@@ -731,21 +761,94 @@ class RecordingDialog(tk.Toplevel):
             w.configure(state=tz_state)
         for w in self._duration_widgets:
             w.configure(state=duration_state)
+        self._update_estimate()
 
-    def _update_interval_estimate(self, *_args) -> None:
+    def _toggle_pacing_fields(self) -> None:
+        length = self.pacing_var.get() == "length"
+        for w in self._interval_widgets:
+            w.configure(state="disabled" if length else "normal")
+        self.target_entry.configure(state="normal" if length else "disabled")
+        self._update_estimate()
+
+    def _session_seconds(self) -> Optional[float]:
+        """Length of one capture session for the currently entered schedule,
+        or None when it has no defined length (Always mode / incomplete
+        fields). Best-effort -- feeds the estimate label only."""
+        mode = self.schedule_mode_var.get()
+        if mode == "duration":
+            minutes = _parse_optional_int_or_none(self.duration_var.get())
+            return minutes * 60 if minutes and minutes > 0 else None
+        if mode == "fixed_time":
+            start_s, end_s = self.start_time_var.get().strip(), self.end_time_var.get().strip()
+            if not (_valid_hhmm(start_s) and _valid_hhmm(end_s)):
+                return None
+            delta = (dt.datetime.strptime(end_s, "%H:%M")
+                     - dt.datetime.strptime(start_s, "%H:%M")).total_seconds()
+            return delta if delta > 0 else delta + 86400  # overnight window
+        if mode == "daylight":
+            latitude = _parse_optional_float(self.lat_var.get())
+            longitude = _parse_optional_float(self.lon_var.get())
+            tz_name = self.tz_var.get().strip()
+            if latitude is None or longitude is None or not is_valid_timezone(tz_name):
+                return None
+            try:
+                temp = Setup(name="", ip="", user="", password="", schedule=Schedule(
+                    mode="daylight", latitude=latitude, longitude=longitude, timezone=tz_name,
+                    pre_offset_minutes=_parse_optional_int(self.pre_offset_var.get()),
+                    post_offset_minutes=_parse_optional_int(self.post_offset_var.get()),
+                ))
+                window = daylight_window(temp, dt.date.today())
+                return (window.end - window.start).total_seconds()
+            except Exception:
+                return None
+        return None  # "always"
+
+    def _update_estimate(self, *_args) -> None:
+        try:
+            fps = float(self.fps_var.get())
+            if fps <= 0:
+                raise ValueError
+        except ValueError:
+            self.estimate_var.set("")
+            return
+        session_secs = self._session_seconds()
+
+        if self.pacing_var.get() == "length":
+            target = _parse_optional_int_or_none(self.target_var.get())
+            if not target or target <= 0:
+                self.estimate_var.set("")
+                return
+            if session_secs is None:
+                self.estimate_var.set(
+                    "Target length needs a schedule with a set session length (not Always)."
+                )
+                return
+            interval = max(session_secs / (target * fps), 0.05)
+            self.estimate_var.set(
+                f"~1 frame every {interval:.2f}s over a {session_secs / 3600:.1f}h session "
+                f"-> {target}s video at {fps:g} fps"
+            )
+            return
+
         try:
             interval = float(self.interval_var.get())
             if interval <= 0:
                 raise ValueError
         except ValueError:
-            self.interval_estimate_var.set("")
+            self.estimate_var.set("")
             return
-        frames_per_hour = 3600 / interval
-        video_seconds_per_hour = frames_per_hour / 30
-        self.interval_estimate_var.set(
-            f"~{frames_per_hour:.0f} frames/hour -> {video_seconds_per_hour:.1f}s of video "
-            f"per hour of capture at 30fps"
-        )
+        if session_secs is None:
+            frames_per_hour = 3600 / interval
+            self.estimate_var.set(
+                f"~{frames_per_hour:.0f} frames/hour -> {frames_per_hour / fps:.1f}s of video "
+                f"per hour of capture at {fps:g} fps"
+            )
+        else:
+            frames = session_secs / interval
+            self.estimate_var.set(
+                f"~{frames:.0f} frames over a {session_secs / 3600:.1f}h session "
+                f"-> ~{frames / fps:.1f}s video at {fps:g} fps"
+            )
 
     def _open_map(self) -> None:
         LocationMapDialog(self, self.lat_var, self.lon_var)
@@ -776,14 +879,42 @@ class RecordingDialog(tk.Toplevel):
             return
 
         try:
-            interval = float(self.interval_var.get())
-            if interval <= 0:
+            output_fps = float(self.fps_var.get())
+            if output_fps <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid", "Seconds between frames must be a number greater than 0.")
+            messagebox.showerror("Invalid", "Output video fps must be a number greater than 0.")
             return
 
         mode = self.schedule_mode_var.get()
+
+        target_video_seconds = None
+        if self.pacing_var.get() == "length":
+            if mode == "always":
+                messagebox.showerror(
+                    "Invalid",
+                    "Target video length needs a schedule with a set session length "
+                    "(Daylight hours, Fixed daily time, or Timer) -- use interval "
+                    "pacing for Always mode.",
+                )
+                return
+            target_video_seconds = _parse_optional_int_or_none(self.target_var.get())
+            if not target_video_seconds or target_video_seconds <= 0:
+                messagebox.showerror("Invalid", "Enter the target video length in seconds.")
+                return
+            # interval is unused while length-paced but kept as a sane
+            # fallback value; don't block save on whatever's in that box.
+            interval = _parse_optional_float(self.interval_var.get())
+            if not interval or interval <= 0:
+                interval = self.existing.interval if self.existing else 30
+        else:
+            try:
+                interval = float(self.interval_var.get())
+                if interval <= 0:
+                    raise ValueError
+            except ValueError:
+                messagebox.showerror("Invalid", "Seconds between frames must be a number greater than 0.")
+                return
         # Parse every schedule field regardless of the active mode so
         # switching modes and saving never discards already-entered values --
         # switching back later (even in a future edit) won't require re-typing.
@@ -824,7 +955,9 @@ class RecordingDialog(tk.Toplevel):
         )
 
         recording = Recording(
-            name=name, camera_name=camera_name, interval=interval, schedule=schedule,
+            name=name, camera_name=camera_name, interval=interval,
+            output_fps=output_fps, target_video_seconds=target_video_seconds,
+            schedule=schedule,
         )
         self.config.put_recording(recording)
         self.config.save()
@@ -971,13 +1104,21 @@ class BuildDialog(tk.Toplevel):
         self.sessions = self._list_sessions()
         scope_values = [label for label, _ in self.sessions] + [ALL_SESSIONS]
         self.scope_var = tk.StringVar(value=scope_values[0])
-        add_row("Frames to use", ttk.Combobox(
+        self.scope_combo = ttk.Combobox(
             self, textvariable=self.scope_var, state="readonly",
             values=scope_values, width=34,
-        ))
+        )
+        add_row("Frames to use", self.scope_combo)
+        self.scope_combo.bind("<<ComboboxSelected>>", self._update_build_estimate)
 
-        self.fps_var = tk.StringVar(value="30")
+        self.fps_var = tk.StringVar(value=f"{setup.output_fps:g}")
         add_row("Output fps", ttk.Entry(self, textvariable=self.fps_var))
+
+        self.est_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.est_var, foreground="gray").grid(
+            row=row, column=0, columnspan=2, sticky="w", padx=6)
+        row += 1
+        self.fps_var.trace_add("write", self._update_build_estimate)
 
         self.date_var = tk.StringVar(value="")
         add_row("Single date (YYYY-MM-DD, optional)", ttk.Entry(self, textvariable=self.date_var))
@@ -998,14 +1139,20 @@ class BuildDialog(tk.Toplevel):
         self.build_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side="left", padx=4)
 
+        self._update_build_estimate()
+
     def _list_sessions(self) -> list:
         """[(label, session_dir_path)] for session subfolders that contain
         frames, newest first. Labels carry a readable start time and frame
-        count so the right session is easy to spot."""
+        count so the right session is easy to spot. Also records per-scope
+        frame counts for the estimated-length label."""
         sessions = []
+        self._scope_counts: dict = {}
         root = Path(self.setup.frames_dir)
         if not root.is_dir():
+            self._scope_counts[ALL_SESSIONS] = 0
             return sessions
+        total = sum(1 for _ in root.glob("*.jpg"))  # legacy loose frames
         for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
             count = sum(1 for _ in d.glob("*.jpg"))
             if not count:
@@ -1016,7 +1163,21 @@ class BuildDialog(tk.Toplevel):
             except ValueError:
                 label = f"Session {d.name} ({count} frames)"
             sessions.append((label, str(d)))
+            self._scope_counts[label] = count
+            total += count
+        self._scope_counts[ALL_SESSIONS] = total
         return sessions
+
+    def _update_build_estimate(self, *_args) -> None:
+        frames = self._scope_counts.get(self.scope_var.get(), 0)
+        try:
+            fps = float(self.fps_var.get())
+            if fps <= 0:
+                raise ValueError
+        except ValueError:
+            self.est_var.set("")
+            return
+        self.est_var.set(f"~{frames / fps:.1f}s of video from {frames} frames at {fps:g} fps")
 
     def _parse_date(self, s: str) -> Optional[dt.date]:
         s = s.strip()

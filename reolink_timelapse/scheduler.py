@@ -29,7 +29,7 @@ import os
 import secrets
 import subprocess
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Optional
 
@@ -140,6 +140,30 @@ def _format_time_label(t: dt.datetime) -> str:
     return t.strftime("%Hh%M")
 
 
+MIN_DERIVED_INTERVAL = 0.05  # floor for length-paced intervals (seconds)
+
+
+def _session_capture_setup(setup: Setup, session_start: dt.datetime,
+                           window_end: Optional[dt.datetime], log) -> Setup:
+    """The Setup to capture this session with.
+
+    Length-paced recordings (target_video_seconds set) get their interval
+    derived fresh from this session's actual window duration, so the
+    finished video comes out the target length even as daylight windows
+    drift with the seasons. Interval-paced recordings pass through as-is,
+    as does length-paced "always" mode (no window to divide by -- the GUI/
+    CLI block that combination, but a hand-edited config shouldn't crash).
+    """
+    if not setup.target_video_seconds or window_end is None:
+        return setup
+    duration = (window_end - session_start).total_seconds()
+    frames_needed = setup.target_video_seconds * setup.output_fps
+    interval = max(duration / frames_needed, MIN_DERIVED_INTERVAL)
+    log(f"Pacing for a ~{setup.target_video_seconds}s video at {setup.output_fps:g} fps: "
+        f"1 frame every {interval:.2f}s over this {duration / 3600:.2f}h window.")
+    return replace(setup, interval=interval)
+
+
 def _auto_build_session(
     setup: Setup, session_dir: str, start: dt.datetime, end: dt.datetime, log
 ) -> None:
@@ -151,7 +175,8 @@ def _auto_build_session(
     output_file = os.path.join(setup.output_dir, filename)
     log(f"Building video for this session: {filename}")
     try:
-        out = build_timelapse(setup, frames_dir=session_dir, output_file=output_file)
+        out = build_timelapse(setup, output_fps=setup.output_fps,
+                              frames_dir=session_dir, output_file=output_file)
         log(f"Video ready: {out}")
     except (SystemExit, Exception) as e:
         log(f"Auto-build failed for '{setup.name}': {e}")
@@ -194,7 +219,8 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
             log(f"Capturing for '{setup.name}' into session '{os.path.basename(session_dir)}'"
                 + (f" until {window_end.strftime('%H:%M:%S %Z')}" if window_end else "")
                 + "...")
-            proc = start_capture_process(setup, session_dir)
+            capture_setup = _session_capture_setup(setup, session_start, window_end, log)
+            proc = start_capture_process(capture_setup, session_dir)
 
             while True:
                 outcome = _wait_capture(proc, window_end, setup, stop_event)
@@ -207,7 +233,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
                         break
                     if window_end is not None and _now(setup) >= window_end:
                         break
-                    proc = start_capture_process(setup, session_dir)  # same session, retrying
+                    proc = start_capture_process(capture_setup, session_dir)  # same session, retrying
                     continue
                 break  # "window_end" or "stopped"
 
