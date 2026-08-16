@@ -1,0 +1,13 @@
+# Captured frames and rendered videos
+frames/
+*.mp4
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Secrets / local config
+.env
+config.local.*
