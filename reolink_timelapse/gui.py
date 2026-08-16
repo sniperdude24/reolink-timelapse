@@ -17,6 +17,26 @@ from .config import Config, Schedule, Setup, default_setup_dirs, is_valid_timezo
 from .scheduler import run_scheduled
 
 
+def _parse_optional_float(raw: str) -> Optional[float]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except ValueError:
+        return None
+
+
+def _parse_optional_int(raw: str, default: int = 0) -> int:
+    raw = raw.strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
 @dataclass
 class RunningCapture:
     thread: threading.Thread
@@ -279,7 +299,20 @@ class SetupDialog(tk.Toplevel):
         add_row("Stream", stream_frame)
 
         self.interval_var = tk.StringVar(value=str(existing.interval if existing else 30))
-        add_row("Seconds between frames", ttk.Entry(self, textvariable=self.interval_var))
+        self.interval_var.trace_add("write", self._update_interval_estimate)
+
+        interval_container = ttk.Frame(self)
+        entry_row = ttk.Frame(interval_container)
+        ttk.Entry(entry_row, textvariable=self.interval_var, width=8).pack(side="left")
+        for preset_label, seconds in [("5s", 5), ("10s", 10), ("30s", 30), ("1min", 60), ("5min", 300)]:
+            ttk.Button(entry_row, text=preset_label, width=5,
+                       command=lambda s=seconds: self.interval_var.set(str(s))).pack(side="left", padx=2)
+        entry_row.pack(anchor="w")
+
+        self.interval_estimate_var = tk.StringVar(value="")
+        ttk.Label(interval_container, textvariable=self.interval_estimate_var,
+                  foreground="gray").pack(anchor="w", pady=(2, 0))
+        add_row("Seconds between frames", interval_container)
 
         default_frames, default_output = default_setup_dirs(existing.name if existing else "setup")
         self.frames_dir_var = tk.StringVar(
@@ -335,11 +368,27 @@ class SetupDialog(tk.Toplevel):
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
 
         self._toggle_daylight_fields()
+        self._update_interval_estimate()
 
     def _toggle_daylight_fields(self) -> None:
         state = "normal" if self.schedule_mode_var.get() == "daylight" else "disabled"
         for entry in (self.lat_entry, self.lon_entry, self.tz_entry, self.pre_entry, self.post_entry):
             entry.configure(state=state)
+
+    def _update_interval_estimate(self, *_args) -> None:
+        try:
+            interval = float(self.interval_var.get())
+            if interval <= 0:
+                raise ValueError
+        except ValueError:
+            self.interval_estimate_var.set("")
+            return
+        frames_per_hour = 3600 / interval
+        video_seconds_per_hour = frames_per_hour / 30
+        self.interval_estimate_var.set(
+            f"~{frames_per_hour:.0f} frames/hour -> {video_seconds_per_hour:.1f}s of video "
+            f"per hour of capture at 30fps"
+        )
 
     def _browse(self, var: tk.StringVar) -> None:
         path = filedialog.askdirectory(initialdir=var.get() or str(Path.home()))
@@ -382,29 +431,31 @@ class SetupDialog(tk.Toplevel):
         output_dir = self.output_dir_var.get().strip() or str(default_output)
 
         mode = self.schedule_mode_var.get()
+        # Parse regardless of mode so switching to "Always" and saving doesn't
+        # discard already-entered coordinates -- switching back to "Daylight
+        # hours" later (even in a future edit session) won't require re-typing.
+        latitude = _parse_optional_float(self.lat_var.get())
+        longitude = _parse_optional_float(self.lon_var.get())
+        timezone = self.tz_var.get().strip() or None
+        pre_offset = _parse_optional_int(self.pre_offset_var.get())
+        post_offset = _parse_optional_int(self.post_offset_var.get())
+
         if mode == "daylight":
-            try:
-                latitude = float(self.lat_var.get())
-                longitude = float(self.lon_var.get())
-                pre_offset = int(self.pre_offset_var.get() or 0)
-                post_offset = int(self.post_offset_var.get() or 0)
-            except ValueError:
-                messagebox.showerror("Invalid", "Latitude, longitude, and offsets must be numbers.")
+            if latitude is None or longitude is None:
+                messagebox.showerror("Invalid", "Latitude and longitude are required for daylight-hours scheduling.")
                 return
-            timezone = self.tz_var.get().strip()
-            if not is_valid_timezone(timezone):
+            if not timezone or not is_valid_timezone(timezone):
                 messagebox.showerror(
                     "Invalid timezone",
-                    f"'{timezone}' isn't a recognized IANA timezone name, "
+                    f"'{timezone or ''}' isn't a recognized IANA timezone name, "
                     f"e.g. America/New_York, Europe/London, Asia/Tokyo.",
                 )
                 return
-            schedule = Schedule(
-                mode="daylight", latitude=latitude, longitude=longitude,
-                timezone=timezone, pre_offset_minutes=pre_offset, post_offset_minutes=post_offset,
-            )
-        else:
-            schedule = Schedule(mode="always")
+
+        schedule = Schedule(
+            mode=mode, latitude=latitude, longitude=longitude,
+            timezone=timezone, pre_offset_minutes=pre_offset, post_offset_minutes=post_offset,
+        )
 
         setup = Setup(
             name=name, ip=ip, port=port, user=user, password=password,
