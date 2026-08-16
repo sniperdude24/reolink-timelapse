@@ -82,6 +82,8 @@ class App:
         self.running: dict[str, RunningCapture] = {}
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._closed = False
+        self._closing = False
+        self._window_refresh_tick = 0
 
         self._build_widgets()
         if self.config.migrated_from:
@@ -217,12 +219,27 @@ class App:
         return f"{day_label} {_fmt_time(window.start)}-{_fmt_time(window.end)}"
 
     def _refresh_status_loop(self) -> None:
+        # Only the Status cells change tick-to-tick, so update those in
+        # place rather than rebuilding both trees every second (which
+        # churned selection and recomputed sunrise/sunset per row per tick).
+        # Window labels drift once a day; refreshing them once a minute is
+        # plenty. Full refresh_lists() still runs on add/edit/remove/start.
         if self._closed:
             return
         for name in list(self.running):
             if not self.running[name].thread.is_alive():
                 del self.running[name]
-        self.refresh_lists()
+        for iid in self.recording_tree.get_children():
+            status = "Running" if iid in self.running else "Stopped"
+            if self.recording_tree.set(iid, "status") != status:
+                self.recording_tree.set(iid, "status", status)
+        self._window_refresh_tick += 1
+        if self._window_refresh_tick >= 60:
+            self._window_refresh_tick = 0
+            for iid in self.recording_tree.get_children():
+                recording = self.config.recordings.get(iid)
+                if recording:
+                    self.recording_tree.set(iid, "window", self._window_label(recording))
         self.root.after(1000, self._refresh_status_loop)
 
     def _tree_selection(self, tree: ttk.Treeview) -> Optional[str]:
@@ -384,15 +401,28 @@ class App:
     # ---- shutdown ----
 
     def on_close(self) -> None:
+        if self._closing:
+            return
         if self.running:
             if not messagebox.askyesno(
                 "Quit", f"{len(self.running)} recording(s) still capturing. Stop them and quit?"
             ):
                 return
+            self._closing = True
+            self.root.title("Reolink Timelapse - finishing video builds...")
             for rc in self.running.values():
                 rc.stop_event.set()
-            for rc in self.running.values():
-                rc.thread.join(timeout=15)
+            # Each worker stops ffmpeg and then builds its session's video,
+            # which can take minutes -- a fixed join timeout here would kill
+            # those builds mid-write (daemon threads die with the app). Wait
+            # them out instead, pumping the UI so log lines stay visible.
+            while any(rc.thread.is_alive() for rc in self.running.values()):
+                for rc in list(self.running.values()):
+                    rc.thread.join(timeout=0.2)
+                try:
+                    self.root.update()
+                except tk.TclError:
+                    break
         self._closed = True
         self.root.destroy()
 
@@ -559,6 +589,14 @@ class RecordingDialog(tk.Toplevel):
                    command=lambda: self._browse(self.output_dir_var)).pack(side="left", padx=4)
         add_row("Video output folder", output_frame)
 
+        # Default folders follow the recording name as it's typed, but only
+        # while the user hasn't edited them -- otherwise every new recording
+        # left on defaults would land in the same Timelapses\recording\
+        # folder and Build Video would mix their frames.
+        self._auto_frames = "" if existing else str(default_frames)
+        self._auto_output = "" if existing else str(default_output)
+        self.name_var.trace_add("write", self._sync_default_dirs)
+
         sched = existing.schedule if existing else Schedule()
         self.schedule_mode_var = tk.StringVar(value=sched.mode)
         mode_frame = ttk.Frame(self)
@@ -641,6 +679,16 @@ class RecordingDialog(tk.Toplevel):
         for w in self._duration_widgets:
             w.configure(state=duration_state)
 
+    def _sync_default_dirs(self, *_args) -> None:
+        name = self.name_var.get().strip()
+        new_frames, new_output = default_setup_dirs(name or "recording")
+        if self.frames_dir_var.get() == self._auto_frames:
+            self._auto_frames = str(new_frames)
+            self.frames_dir_var.set(self._auto_frames)
+        if self.output_dir_var.get() == self._auto_output:
+            self._auto_output = str(new_output)
+            self.output_dir_var.set(self._auto_output)
+
     def _update_interval_estimate(self, *_args) -> None:
         try:
             interval = float(self.interval_var.get())
@@ -691,8 +739,10 @@ class RecordingDialog(tk.Toplevel):
 
         try:
             interval = float(self.interval_var.get())
+            if interval <= 0:
+                raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid", "Seconds between frames must be a number.")
+            messagebox.showerror("Invalid", "Seconds between frames must be a number greater than 0.")
             return
 
         default_frames, default_output = default_setup_dirs(name)
@@ -858,6 +908,9 @@ class LocationMapDialog(tk.Toplevel):
         self.destroy()
 
 
+ALL_SESSIONS = "All sessions (entire history)"
+
+
 class BuildDialog(tk.Toplevel):
     def __init__(self, parent, setup, log):
         super().__init__(parent)
@@ -877,6 +930,18 @@ class BuildDialog(tk.Toplevel):
             widget.grid(row=row, column=1, sticky="we", **pad)
             row += 1
             return row
+
+        # Sessions newest-first, defaulting to the most recent one. Building
+        # "everything ever captured" when the user just wants the session
+        # they recorded produced videos that opened with frames from long
+        # before -- make session scope the explicit, default choice.
+        self.sessions = self._list_sessions()
+        scope_values = [label for label, _ in self.sessions] + [ALL_SESSIONS]
+        self.scope_var = tk.StringVar(value=scope_values[0])
+        add_row("Frames to use", ttk.Combobox(
+            self, textvariable=self.scope_var, state="readonly",
+            values=scope_values, width=34,
+        ))
 
         self.fps_var = tk.StringVar(value="30")
         add_row("Output fps", ttk.Entry(self, textvariable=self.fps_var))
@@ -900,6 +965,26 @@ class BuildDialog(tk.Toplevel):
         self.build_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side="left", padx=4)
 
+    def _list_sessions(self) -> list:
+        """[(label, session_dir_path)] for session subfolders that contain
+        frames, newest first. Labels carry a readable start time and frame
+        count so the right session is easy to spot."""
+        sessions = []
+        root = Path(self.setup.frames_dir)
+        if not root.is_dir():
+            return sessions
+        for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+            count = sum(1 for _ in d.glob("*.jpg"))
+            if not count:
+                continue
+            try:
+                started = dt.datetime.strptime(d.name[:15], "%Y%m%d_%H%M%S")
+                label = f"Session {started:%Y-%m-%d %H:%M} ({count} frames)"
+            except ValueError:
+                label = f"Session {d.name} ({count} frames)"
+            sessions.append((label, str(d)))
+        return sessions
+
     def _parse_date(self, s: str) -> Optional[dt.date]:
         s = s.strip()
         return dt.date.fromisoformat(s) if s else None
@@ -914,17 +999,20 @@ class BuildDialog(tk.Toplevel):
             messagebox.showerror("Invalid", "Check the fps/date fields (dates must be YYYY-MM-DD).")
             return
 
+        scope = self.scope_var.get()
+        frames_dir = next((path for label, path in self.sessions if label == scope), None)
+
         self.build_btn.configure(state="disabled")
         self.status_var.set("Building...")
-        self.log(f"Building video for '{self.setup.name}'...")
+        self.log(f"Building video for '{self.setup.name}' ({scope})...")
 
         self._result_queue: "queue.Queue[tuple]" = queue.Queue()
         threading.Thread(
-            target=self._worker, args=(fps, start_date, end_date), daemon=True
+            target=self._worker, args=(fps, start_date, end_date, frames_dir), daemon=True
         ).start()
         self.after(100, self._poll_result)
 
-    def _worker(self, fps: float, start_date, end_date) -> None:
+    def _worker(self, fps: float, start_date, end_date, frames_dir: Optional[str]) -> None:
         # Runs on a background thread -- must never touch Tk widgets directly,
         # only hand the result to the main thread via the queue. Calling
         # self.after() from here intermittently raised "main thread is not
@@ -933,6 +1021,7 @@ class BuildDialog(tk.Toplevel):
         try:
             out = build_timelapse(
                 self.setup, output_fps=fps, start_date=start_date, end_date=end_date,
+                frames_dir=frames_dir,
             )
             self._result_queue.put((out, None))
         except (SystemExit, Exception) as e:

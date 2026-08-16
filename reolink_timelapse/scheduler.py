@@ -38,7 +38,7 @@ from astral.sun import sun
 from zoneinfo import ZoneInfo
 
 from .build import build_timelapse
-from .capture import start_capture_process, stop_capture_process
+from .capture import read_capture_stderr, start_capture_process, stop_capture_process
 from .config import Setup
 
 RETRY_DELAY_SECONDS = 30
@@ -200,7 +200,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
                 outcome = _wait_capture(proc, window_end, setup, stop_event)
 
                 if outcome == "exited":
-                    stderr = proc.stderr.read() if proc.stderr else ""
+                    stderr = read_capture_stderr(proc)
                     log(f"ffmpeg exited unexpectedly (code {proc.returncode}). "
                         f"Retrying in {RETRY_DELAY_SECONDS}s. Last output:\n{stderr[-500:]}")
                     if stop_event.wait(RETRY_DELAY_SECONDS):

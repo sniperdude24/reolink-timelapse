@@ -141,7 +141,11 @@ def cmd_record(args: argparse.Namespace) -> None:
     print(f"Configuring recording '{args.name}' (camera: {camera_name})"
           + (" (editing existing)" if existing else "") + "\n")
 
-    interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
+    while True:
+        interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
+        if interval > 0:
+            break
+        print("  Interval must be greater than 0.")
 
     default_frames, default_output = default_setup_dirs(args.name)
     frames_dir = _prompt(
