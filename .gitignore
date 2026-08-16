@@ -10,6 +10,7 @@ build/
 dist/
 *.spec
 reolink-timelapse-win64-*.zip
+reolink-timelapse-gui-win64-*.zip
 .venv/
 venv/
 
