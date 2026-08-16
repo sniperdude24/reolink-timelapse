@@ -3,8 +3,9 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import getpass
+from typing import Optional
 
-from .config import Config, Setup, Schedule, default_setup_dirs, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, default_setup_dirs, is_valid_timezone
 from .build import build_timelapse
 from .scheduler import run_scheduled
 
@@ -22,6 +23,15 @@ def _prompt(label: str, default=None, cast=str):
             return cast(raw)
         except ValueError:
             print(f"  Please enter a valid {cast.__name__}.")
+
+
+def _prompt_choice(label: str, options: list, default: str) -> str:
+    opts_str = "/".join(options)
+    while True:
+        raw = _prompt(f"{label} ({opts_str})", default)
+        if raw in options:
+            return raw
+        print(f"  Please enter one of: {opts_str}")
 
 
 def _prompt_timezone(label: str, default=None) -> str:
@@ -51,11 +61,45 @@ def _open_config() -> Config:
     return config
 
 
+def _prompt_schedule(existing: Optional[Schedule]) -> Schedule:
+    sched = existing or Schedule()
+    mode = _prompt_choice(
+        "Schedule mode", ["daylight", "fixed_time", "duration", "always"], sched.mode
+    )
+    if mode == "daylight":
+        latitude = _prompt("Latitude (e.g. 40.4406)", sched.latitude, float)
+        longitude = _prompt("Longitude (e.g. -79.9959)", sched.longitude, float)
+        timezone = _prompt_timezone(
+            "IANA timezone name (e.g. America/New_York)", sched.timezone
+        )
+        pre_offset = _prompt(
+            "Start capturing this many minutes before sunrise", sched.pre_offset_minutes, int
+        )
+        post_offset = _prompt(
+            "Keep capturing this many minutes after sunset", sched.post_offset_minutes, int
+        )
+        return Schedule(
+            mode=mode, latitude=latitude, longitude=longitude, timezone=timezone,
+            pre_offset_minutes=pre_offset, post_offset_minutes=post_offset,
+        )
+    if mode == "fixed_time":
+        timezone = _prompt_timezone(
+            "IANA timezone name (e.g. America/New_York)", sched.timezone
+        )
+        start_time = _prompt("Start time, 24h HH:MM", sched.start_time or "07:00")
+        end_time = _prompt("End time, 24h HH:MM", sched.end_time or "19:00")
+        return Schedule(mode=mode, timezone=timezone, start_time=start_time, end_time=end_time)
+    if mode == "duration":
+        duration = _prompt("Run for how many minutes", sched.duration_minutes or 60, int)
+        return Schedule(mode=mode, duration_minutes=duration)
+    return Schedule(mode="always")
+
+
 def cmd_configure(args: argparse.Namespace) -> None:
     config = _open_config()
-    existing = config.setups.get(args.name)
+    existing = config.cameras.get(args.name)
 
-    print(f"Configuring setup '{args.name}'" + (" (editing existing)" if existing else "") + "\n")
+    print(f"Configuring camera '{args.name}'" + (" (editing existing)" if existing else "") + "\n")
 
     ip = _prompt("Camera IP address", existing.ip if existing else None)
     port = _prompt("RTSP port", existing.port if existing else 554, int)
@@ -75,6 +119,28 @@ def cmd_configure(args: argparse.Namespace) -> None:
         "Use the lower-res substream (recommended)?",
         existing.substream if existing else True,
     )
+
+    camera = Camera(
+        name=args.name, ip=ip, port=port, user=user, password=password,
+        channel=channel, substream=substream,
+    )
+    config.put_camera(camera)
+    config.save()
+    print(f"\nSaved camera '{args.name}' to {config.path}")
+
+
+def cmd_record(args: argparse.Namespace) -> None:
+    config = _open_config()
+    existing = config.recordings.get(args.name)
+
+    camera_name = args.camera or (existing.camera_name if existing else None)
+    if not camera_name:
+        raise SystemExit("--camera is required when adding a new recording.")
+    config.get_camera(camera_name)  # raises a clear error if it doesn't exist
+
+    print(f"Configuring recording '{args.name}' (camera: {camera_name})"
+          + (" (editing existing)" if existing else "") + "\n")
+
     interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
 
     default_frames, default_output = default_setup_dirs(args.name)
@@ -87,83 +153,62 @@ def cmd_configure(args: argparse.Namespace) -> None:
         existing.output_dir if existing else str(default_output),
     )
 
-    sched = existing.schedule if existing else Schedule()
-    daylight = _prompt_yes_no(
-        "Only capture during daylight hours (auto sunrise/sunset)?",
-        sched.mode == "daylight",
-    )
-    if daylight:
-        latitude = _prompt("Latitude (e.g. 40.4406)", sched.latitude, float)
-        longitude = _prompt("Longitude (e.g. -79.9959)", sched.longitude, float)
-        timezone = _prompt_timezone(
-            "IANA timezone name (e.g. America/New_York)", sched.timezone
-        )
-        pre_offset = _prompt(
-            "Start capturing this many minutes before sunrise",
-            sched.pre_offset_minutes, int,
-        )
-        post_offset = _prompt(
-            "Keep capturing this many minutes after sunset",
-            sched.post_offset_minutes, int,
-        )
-        sched = Schedule(
-            mode="daylight",
-            latitude=latitude,
-            longitude=longitude,
-            timezone=timezone,
-            pre_offset_minutes=pre_offset,
-            post_offset_minutes=post_offset,
-        )
-    else:
-        sched = Schedule(mode="always")
+    sched = _prompt_schedule(existing.schedule if existing else None)
 
-    setup = Setup(
-        name=args.name,
-        ip=ip,
-        port=port,
-        user=user,
-        password=password,
-        channel=channel,
-        substream=substream,
-        interval=interval,
-        frames_dir=frames_dir,
-        output_dir=output_dir,
-        schedule=sched,
+    recording = Recording(
+        name=args.name, camera_name=camera_name, interval=interval,
+        frames_dir=frames_dir, output_dir=output_dir, schedule=sched,
     )
-    config.put(setup)
+    config.put_recording(recording)
     config.save()
-    print(f"\nSaved setup '{args.name}' to {config.path}")
+    print(f"\nSaved recording '{args.name}' to {config.path}")
 
 
 def cmd_list(args: argparse.Namespace) -> None:
     config = _open_config()
-    if not config.setups:
-        print("No setups configured yet. Run 'reolink-timelapse configure <name>' to add one.")
+    if not config.cameras and not config.recordings:
+        print("Nothing configured yet. Run 'reolink-timelapse configure <name>' to add a camera.")
         return
-    for name, s in sorted(config.setups.items()):
-        mode = s.schedule.mode
-        print(f"{name}: {s.ip}:{s.port} channel {s.channel} "
-              f"({'sub' if s.substream else 'main'} stream, every {s.interval}s) "
-              f"schedule={mode}")
+
+    print("Cameras:")
+    if not config.cameras:
+        print("  (none)")
+    for name, c in sorted(config.cameras.items()):
+        print(f"  {name}: {c.ip}:{c.port} channel {c.channel} "
+              f"({'sub' if c.substream else 'main'} stream)")
+
+    print("\nRecordings:")
+    if not config.recordings:
+        print("  (none)")
+    for name, r in sorted(config.recordings.items()):
+        print(f"  {name}: camera={r.camera_name} every {r.interval}s schedule={r.schedule.mode}")
 
 
-def cmd_remove(args: argparse.Namespace) -> None:
+def cmd_remove_camera(args: argparse.Namespace) -> None:
     config = _open_config()
-    config.get(args.name)  # raises a clear error if missing
-    config.remove(args.name)
+    config.get_camera(args.name)  # raises a clear error if missing
+    config.remove_camera(args.name)  # raises if a recording still references it
     config.save()
-    print(f"Removed setup '{args.name}'.")
+    print(f"Removed camera '{args.name}'.")
+
+
+def cmd_remove_recording(args: argparse.Namespace) -> None:
+    config = _open_config()
+    config.get_recording(args.name)  # raises a clear error if missing
+    config.remove_recording(args.name)
+    config.save()
+    print(f"Removed recording '{args.name}'.")
 
 
 def cmd_run(args: argparse.Namespace) -> None:
     config = _open_config()
-    setup = config.get(args.name)
+    setup = config.resolved(args.name)
     run_scheduled(setup)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
     config = _open_config()
-    setup = config.get(args.name)
+    setup = config.resolved(args.name)
     start_date = dt.date.fromisoformat(args.start_date) if args.start_date else None
     end_date = dt.date.fromisoformat(args.end_date) if args.end_date else None
     if args.date:
@@ -187,22 +232,32 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="reolink-timelapse",
         description="Record and build timelapses from Reolink (or any RTSP) cameras, "
-                     "across any number of camera setups.",
+                     "across any number of camera sources and scheduled recordings.",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("configure", help="Add or edit a camera setup")
-    p.add_argument("name", help="Short name for this setup, e.g. 'backyard'")
+    p = sub.add_parser("configure", help="Add or edit a camera source")
+    p.add_argument("name", help="Short name for this camera, e.g. 'backyard'")
     p.set_defaults(func=cmd_configure)
 
-    p = sub.add_parser("list", help="List configured setups")
+    p = sub.add_parser("record", help="Add or edit a scheduled recording")
+    p.add_argument("name", help="Short name for this recording")
+    p.add_argument("--camera", default=None,
+                    help="Name of an already-configured camera (required when adding new)")
+    p.set_defaults(func=cmd_record)
+
+    p = sub.add_parser("list", help="List configured cameras and recordings")
     p.set_defaults(func=cmd_list)
 
-    p = sub.add_parser("remove", help="Remove a configured setup")
+    p = sub.add_parser("remove-camera", help="Remove a configured camera")
     p.add_argument("name")
-    p.set_defaults(func=cmd_remove)
+    p.set_defaults(func=cmd_remove_camera)
 
-    p = sub.add_parser("run", help="Start capturing frames for a setup (long-running)")
+    p = sub.add_parser("remove-recording", help="Remove a configured recording")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_remove_recording)
+
+    p = sub.add_parser("run", help="Start capturing frames for a recording (long-running)")
     p.add_argument("name")
     p.set_defaults(func=cmd_run)
 

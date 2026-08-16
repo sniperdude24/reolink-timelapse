@@ -1,9 +1,13 @@
 """Long-running daily scheduler: captures only during the configured window.
 
-For schedule.mode == "daylight" the window is today's actual sunrise/sunset
-at the setup's location (recomputed every day, so it drifts correctly with
-the seasons), widened by pre/post offset minutes. For "always" there is no
-window and capture just runs continuously.
+Four schedule modes: "daylight" -- today's actual sunrise/sunset at the
+setup's location (recomputed every day, so it drifts correctly with the
+seasons), widened by pre/post offset minutes. "fixed_time" -- the same
+daily-recurring idea, but with clock times you set instead of computed
+sunrise/sunset. "always" -- no window, capture runs continuously until
+stopped. "duration" -- a manual one-shot timer: capture starts as soon as
+run_scheduled() is called and stops itself after schedule.duration_minutes,
+with no daily repeat.
 
 Every wait in here is chunked against a threading.Event rather than one long
 blocking sleep, so a caller (the GUI, running this in a background thread)
@@ -57,17 +61,37 @@ def daylight_window(setup: Setup, date: dt.date) -> Window:
     return Window(start=start, end=end)
 
 
+def fixed_time_window(setup: Setup, date: dt.date) -> Window:
+    sched = setup.schedule
+    tz = ZoneInfo(sched.timezone) if sched.timezone else dt.datetime.now().astimezone().tzinfo
+    start_t = dt.datetime.strptime(sched.start_time, "%H:%M").time()
+    end_t = dt.datetime.strptime(sched.end_time, "%H:%M").time()
+    start = dt.datetime.combine(date, start_t, tzinfo=tz)
+    end = dt.datetime.combine(date, end_t, tzinfo=tz)
+    if end <= start:
+        end += dt.timedelta(days=1)  # overnight window, e.g. 22:00-02:00
+    return Window(start=start, end=end)
+
+
 def _now(setup: Setup) -> dt.datetime:
     if setup.schedule.timezone:
         return dt.datetime.now(ZoneInfo(setup.schedule.timezone))
     return dt.datetime.now().astimezone()
 
 
+def _window_for(setup: Setup, date: dt.date) -> Window:
+    if setup.schedule.mode == "fixed_time":
+        return fixed_time_window(setup, date)
+    return daylight_window(setup, date)
+
+
 def next_window(setup: Setup) -> Window:
+    """Today's (or tomorrow's, if today's has ended) window for the
+    "daylight" or "fixed_time" recurring modes."""
     now = _now(setup)
-    window = daylight_window(setup, now.date())
+    window = _window_for(setup, now.date())
     if now >= window.end:
-        window = daylight_window(setup, now.date() + dt.timedelta(days=1))
+        window = _window_for(setup, now.date() + dt.timedelta(days=1))
     return window
 
 
@@ -133,10 +157,21 @@ def _auto_build_session(
         log(f"Auto-build failed for '{setup.name}': {e}")
 
 
+_MODE_LABELS = {
+    "daylight": "daylight hours",
+    "fixed_time": "fixed daily time window",
+    "duration": "timer",
+    "always": "continuous",
+}
+
+
 def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event] = None) -> None:
     stop_event = stop_event or threading.Event()
-    log(f"Starting scheduled capture for '{setup.name}' "
-        f"({'daylight hours' if setup.schedule.mode == 'daylight' else 'continuous'}).")
+    mode = setup.schedule.mode
+    label = _MODE_LABELS.get(mode, mode)
+    if mode == "duration":
+        label = f"{label}, {setup.schedule.duration_minutes} min"
+    log(f"Starting scheduled capture for '{setup.name}' ({label}).")
     log("Press Ctrl+C to stop.")
 
     proc = None
@@ -144,12 +179,14 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
     session_start = None
     try:
         while not stop_event.is_set():
-            if setup.schedule.mode == "daylight":
+            if setup.schedule.mode in ("daylight", "fixed_time"):
                 window = next_window(setup)
                 if _sleep_until(window.start, setup, log, stop_event):
                     break
                 window_end = window.end
-            else:
+            elif setup.schedule.mode == "duration":
+                window_end = _now(setup) + dt.timedelta(minutes=setup.schedule.duration_minutes)
+            else:  # "always"
                 window_end = None  # run forever
 
             session_start = _now(setup)
@@ -182,7 +219,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
             session_dir = None
             session_start = None
 
-            if setup.schedule.mode != "daylight" or stop_event.is_set():
+            if setup.schedule.mode not in ("daylight", "fixed_time") or stop_event.is_set():
                 break
     except KeyboardInterrupt:
         log("\nStopped by user.")

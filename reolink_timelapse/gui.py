@@ -1,4 +1,5 @@
-"""Tkinter control panel: add/edit/remove setups, start/stop capture, build videos."""
+"""Tkinter control panel: add/edit/remove cameras and recordings, start/stop
+capture, build videos."""
 
 from __future__ import annotations
 
@@ -11,10 +12,15 @@ from dataclasses import dataclass
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
 from typing import Optional
+from zoneinfo import available_timezones
+
+import tzlocal
 
 from .build import build_timelapse
-from .config import Config, Schedule, Setup, default_setup_dirs, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, default_setup_dirs, is_valid_timezone
 from .scheduler import next_window, run_scheduled
+
+_TIMEZONES = sorted(available_timezones())
 
 
 def _parse_optional_float(raw: str) -> Optional[float]:
@@ -37,6 +43,24 @@ def _parse_optional_int(raw: str, default: int = 0) -> int:
         return default
 
 
+def _parse_optional_int_or_none(raw: str) -> Optional[int]:
+    raw = raw.strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _valid_hhmm(raw: str) -> bool:
+    try:
+        dt.datetime.strptime(raw, "%H:%M")
+        return True
+    except ValueError:
+        return False
+
+
 def _fmt_time(t: dt.datetime) -> str:
     return t.strftime("%I:%M %p").lstrip("0")
 
@@ -51,7 +75,7 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         root.title("Reolink Timelapse")
-        root.geometry("900x560")
+        root.geometry("900x620")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
         self.config = Config()
@@ -64,6 +88,8 @@ class App:
             self.log(f"Migrated existing config from {self.config.migrated_from} to {self.config.path}.")
         if self.config.migration_error:
             self.log(f"WARNING: {self.config.migration_error}")
+        if self.config.schema_migrated:
+            self.log("Upgraded config.yaml to the newer cameras/recordings format.")
         self.refresh_lists()
         self.root.after(200, self._drain_log_queue)
         self.root.after(1000, self._refresh_status_loop)
@@ -75,16 +101,19 @@ class App:
         cameras_frame.pack(fill="x", padx=8, pady=(8, 4))
 
         cameras_toolbar = ttk.Frame(cameras_frame)
-        cameras_toolbar.pack(fill="x", padx=4, pady=4)
-        ttk.Button(cameras_toolbar, text="Add Setup", command=self.on_add).pack(side="left", padx=2)
-        ttk.Button(cameras_toolbar, text="Edit", command=self.on_edit).pack(side="left", padx=2)
-        ttk.Button(cameras_toolbar, text="Remove", command=self.on_remove).pack(side="left", padx=2)
+        cameras_toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Button(cameras_toolbar, text="Add Camera", command=self.on_add_camera).pack(side="left", padx=2)
+        ttk.Button(cameras_toolbar, text="Remove", command=self.on_remove_camera).pack(side="left", padx=2)
+
+        cameras_toolbar2 = ttk.Frame(cameras_frame)
+        cameras_toolbar2.pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(cameras_toolbar2, text="Edit", command=self.on_edit_camera).pack(side="left", padx=2)
 
         self.camera_tree = ttk.Treeview(
             cameras_frame, columns=("camera", "channel", "stream"), show="tree headings", height=5
         )
-        self.camera_tree.heading("#0", text="Setup")
-        self.camera_tree.heading("camera", text="Camera")
+        self.camera_tree.heading("#0", text="Camera")
+        self.camera_tree.heading("camera", text="Address")
         self.camera_tree.heading("channel", text="Channel")
         self.camera_tree.heading("stream", text="Stream")
         self.camera_tree.column("#0", width=130)
@@ -97,22 +126,31 @@ class App:
         recordings_frame.pack(fill="x", padx=8, pady=(4, 4))
 
         recordings_toolbar = ttk.Frame(recordings_frame)
-        recordings_toolbar.pack(fill="x", padx=4, pady=4)
-        ttk.Button(recordings_toolbar, text="Start", command=self.on_start).pack(side="left", padx=2)
-        ttk.Button(recordings_toolbar, text="Stop", command=self.on_stop).pack(side="left", padx=2)
-        ttk.Button(recordings_toolbar, text="Build Video...", command=self.on_build).pack(side="left", padx=2)
-        ttk.Button(recordings_toolbar, text="Open Folder", command=self.on_open_folder).pack(side="left", padx=2)
+        recordings_toolbar.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Button(recordings_toolbar, text="Add Recording", command=self.on_add_recording).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar, text="Edit", command=self.on_edit_recording).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar, text="Remove", command=self.on_remove_recording).pack(side="left", padx=2)
+
+        recordings_toolbar2 = ttk.Frame(recordings_frame)
+        recordings_toolbar2.pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(recordings_toolbar2, text="Start", command=self.on_start).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar2, text="Stop", command=self.on_stop).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar2, text="Build Video...", command=self.on_build).pack(side="left", padx=2)
+        ttk.Button(recordings_toolbar2, text="Open Folder", command=self.on_open_folder).pack(side="left", padx=2)
 
         self.recording_tree = ttk.Treeview(
-            recordings_frame, columns=("mode", "window", "status"), show="tree headings", height=5
+            recordings_frame, columns=("camera", "mode", "window", "status"),
+            show="tree headings", height=5
         )
-        self.recording_tree.heading("#0", text="Setup")
+        self.recording_tree.heading("#0", text="Recording")
+        self.recording_tree.heading("camera", text="Camera")
         self.recording_tree.heading("mode", text="Schedule")
         self.recording_tree.heading("window", text="Window")
         self.recording_tree.heading("status", text="Status")
-        self.recording_tree.column("#0", width=130)
+        self.recording_tree.column("#0", width=120)
+        self.recording_tree.column("camera", width=100)
         self.recording_tree.column("mode", width=90)
-        self.recording_tree.column("window", width=260)
+        self.recording_tree.column("window", width=220)
         self.recording_tree.column("status", width=90)
         self.recording_tree.pack(fill="x", padx=4, pady=(0, 4))
 
@@ -124,7 +162,7 @@ class App:
         self.log_text.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
 
-    # ---- setup lists ----
+    # ---- lists ----
 
     def refresh_lists(self) -> None:
         self._refresh_camera_tree()
@@ -133,11 +171,11 @@ class App:
     def _refresh_camera_tree(self) -> None:
         selected = self._tree_selection(self.camera_tree)
         self.camera_tree.delete(*self.camera_tree.get_children())
-        for name, s in sorted(self.config.setups.items()):
+        for name, c in sorted(self.config.cameras.items()):
             self.camera_tree.insert("", "end", iid=name, text=name, values=(
-                f"{s.ip}:{s.port}",
-                s.channel,
-                "sub" if s.substream else "main",
+                f"{c.ip}:{c.port}",
+                c.channel,
+                "sub" if c.substream else "main",
             ))
         if selected and self.camera_tree.exists(selected):
             self.camera_tree.selection_set(selected)
@@ -145,23 +183,30 @@ class App:
     def _refresh_recording_tree(self) -> None:
         selected = self._tree_selection(self.recording_tree)
         self.recording_tree.delete(*self.recording_tree.get_children())
-        for name, s in sorted(self.config.setups.items()):
+        for name, r in sorted(self.config.recordings.items()):
             status = "Running" if name in self.running else "Stopped"
             self.recording_tree.insert("", "end", iid=name, text=name, values=(
-                s.schedule.mode,
-                self._window_label(s),
+                r.camera_name,
+                r.schedule.mode,
+                self._window_label(r),
                 status,
             ))
         if selected and self.recording_tree.exists(selected):
             self.recording_tree.selection_set(selected)
 
-    def _window_label(self, s: Setup) -> str:
-        if s.schedule.mode != "daylight":
+    def _window_label(self, r: Recording) -> str:
+        mode = r.schedule.mode
+        if mode == "always":
             return "Continuous"
+        if mode == "duration":
+            return f"Timer: {r.schedule.duration_minutes} min from Start"
         try:
-            window = next_window(s)
+            # next_window() only reads setup.schedule -- a Recording carries
+            # its own Schedule directly, so it works here without resolving
+            # to a full Setup (no camera needed just to preview the window).
+            window = next_window(r)
         except Exception:
-            return "(check location settings)"
+            return "(check schedule settings)"
         now = dt.datetime.now(window.start.tzinfo)
         if window.start.date() == now.date():
             day_label = "Today"
@@ -184,13 +229,13 @@ class App:
         sel = tree.selection()
         return sel[0] if sel else None
 
-    def selected_camera(self) -> Optional[Setup]:
+    def selected_camera(self) -> Optional[Camera]:
         name = self._tree_selection(self.camera_tree)
-        return self.config.setups.get(name) if name else None
+        return self.config.cameras.get(name) if name else None
 
-    def selected_recording(self) -> Optional[Setup]:
+    def selected_recording(self) -> Optional[Recording]:
         name = self._tree_selection(self.recording_tree)
-        return self.config.setups.get(name) if name else None
+        return self.config.recordings.get(name) if name else None
 
     # ---- logging (thread-safe: workers push, only the main thread touches the widget) ----
 
@@ -211,50 +256,92 @@ class App:
             pass
         self.root.after(200, self._drain_log_queue)
 
-    # ---- setup actions ----
+    # ---- camera actions ----
 
-    def on_add(self) -> None:
-        SetupDialog(self.root, self.config, None, self.refresh_lists)
+    def on_add_camera(self) -> None:
+        CameraDialog(self.root, self.config, None, self.refresh_lists)
 
-    def on_edit(self) -> None:
-        setup = self.selected_camera()
-        if not setup:
-            messagebox.showinfo("Edit Setup", "Select a camera first.")
+    def on_edit_camera(self) -> None:
+        camera = self.selected_camera()
+        if not camera:
+            messagebox.showinfo("Edit Camera", "Select a camera first.")
             return
-        SetupDialog(self.root, self.config, setup, self.refresh_lists)
+        CameraDialog(self.root, self.config, camera, self.refresh_lists)
 
-    def on_remove(self) -> None:
+    def on_remove_camera(self) -> None:
         name = self._tree_selection(self.camera_tree)
         if not name:
-            messagebox.showinfo("Remove Setup", "Select a camera first.")
+            messagebox.showinfo("Remove Camera", "Select a camera first.")
+            return
+        using = [r.name for r in self.config.recordings.values() if r.camera_name == name]
+        if any(r in self.running for r in using):
+            messagebox.showwarning(
+                "Remove Camera",
+                f"Stop the recording(s) using '{name}' before removing it.",
+            )
+            return
+        if not messagebox.askyesno("Remove Camera", f"Remove camera '{name}'? This cannot be undone."):
+            return
+        try:
+            self.config.remove_camera(name)
+        except SystemExit as e:
+            messagebox.showerror("Remove Camera", str(e))
+            return
+        self.config.save()
+        self.refresh_lists()
+
+    # ---- recording actions ----
+
+    def on_add_recording(self) -> None:
+        if not self.config.cameras:
+            messagebox.showinfo("Add Recording", "Add a camera first, then add a recording for it.")
+            return
+        RecordingDialog(self.root, self.config, None, self.refresh_lists)
+
+    def on_edit_recording(self) -> None:
+        recording = self.selected_recording()
+        if not recording:
+            messagebox.showinfo("Edit Recording", "Select a recording first.")
+            return
+        RecordingDialog(self.root, self.config, recording, self.refresh_lists)
+
+    def on_remove_recording(self) -> None:
+        name = self._tree_selection(self.recording_tree)
+        if not name:
+            messagebox.showinfo("Remove Recording", "Select a recording first.")
             return
         if name in self.running:
-            messagebox.showwarning("Remove Setup", f"Stop '{name}' before removing it.")
+            messagebox.showwarning("Remove Recording", f"Stop '{name}' before removing it.")
             return
-        if not messagebox.askyesno("Remove Setup", f"Remove setup '{name}'? This cannot be undone."):
+        if not messagebox.askyesno("Remove Recording", f"Remove recording '{name}'? This cannot be undone."):
             return
-        self.config.remove(name)
+        self.config.remove_recording(name)
         self.config.save()
         self.refresh_lists()
 
     # ---- capture control ----
 
     def on_start(self) -> None:
-        setup = self.selected_recording()
-        if not setup:
+        recording = self.selected_recording()
+        if not recording:
             messagebox.showinfo("Start Capture", "Select a recording first.")
             return
-        if setup.name in self.running:
+        if recording.name in self.running:
+            return
+        try:
+            setup = self.config.resolved(recording.name)
+        except SystemExit as e:
+            messagebox.showerror("Start Capture", str(e))
             return
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self._run_worker, args=(setup, stop_event), daemon=True
         )
-        self.running[setup.name] = RunningCapture(thread, stop_event)
+        self.running[recording.name] = RunningCapture(thread, stop_event)
         thread.start()
         self.refresh_lists()
 
-    def _run_worker(self, setup: Setup, stop_event: threading.Event) -> None:
+    def _run_worker(self, setup, stop_event: threading.Event) -> None:
         try:
             run_scheduled(setup, log=self.log, stop_event=stop_event)
         except SystemExit as e:
@@ -275,26 +362,31 @@ class App:
     # ---- build ----
 
     def on_build(self) -> None:
-        setup = self.selected_recording()
-        if not setup:
+        recording = self.selected_recording()
+        if not recording:
             messagebox.showinfo("Build Video", "Select a recording first.")
+            return
+        try:
+            setup = self.config.resolved(recording.name)
+        except SystemExit as e:
+            messagebox.showerror("Build Video", str(e))
             return
         BuildDialog(self.root, setup, self.log)
 
     def on_open_folder(self) -> None:
-        setup = self.selected_recording()
-        if not setup:
+        recording = self.selected_recording()
+        if not recording:
             messagebox.showinfo("Open Folder", "Select a recording first.")
             return
-        os.makedirs(setup.output_dir, exist_ok=True)
-        os.startfile(setup.output_dir)  # Windows only, matches this project's target platform
+        os.makedirs(recording.output_dir, exist_ok=True)
+        os.startfile(recording.output_dir)  # Windows only, matches this project's target platform
 
     # ---- shutdown ----
 
     def on_close(self) -> None:
         if self.running:
             if not messagebox.askyesno(
-                "Quit", f"{len(self.running)} setup(s) still capturing. Stop them and quit?"
+                "Quit", f"{len(self.running)} recording(s) still capturing. Stop them and quit?"
             ):
                 return
             for rc in self.running.values():
@@ -305,13 +397,13 @@ class App:
         self.root.destroy()
 
 
-class SetupDialog(tk.Toplevel):
-    def __init__(self, parent, config: Config, existing: Optional[Setup], on_saved):
+class CameraDialog(tk.Toplevel):
+    def __init__(self, parent, config: Config, existing: Optional[Camera], on_saved):
         super().__init__(parent)
         self.config = config
         self.existing = existing
         self.on_saved = on_saved
-        self.title("Edit Setup" if existing else "Add Setup")
+        self.title("Edit Camera" if existing else "Add Camera")
         self.resizable(False, False)
         self.transient(parent)
         self.grab_set()
@@ -328,7 +420,7 @@ class SetupDialog(tk.Toplevel):
         name_entry = ttk.Entry(self, textvariable=self.name_var)
         if existing:
             name_entry.configure(state="disabled")
-        add_row("Setup name", name_entry)
+        add_row("Camera name", name_entry)
 
         self.ip_var = tk.StringVar(value=existing.ip if existing else "")
         add_row("Camera IP", ttk.Entry(self, textvariable=self.ip_var))
@@ -356,6 +448,82 @@ class SetupDialog(tk.Toplevel):
                          variable=self.stream_var, value="main").pack(anchor="w")
         add_row("Stream", stream_frame)
 
+        btn_frame = ttk.Frame(self)
+        btn_frame.grid(row=self._row, column=0, columnspan=2, pady=8)
+        ttk.Button(btn_frame, text="Save", command=self._save).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+    def _save(self) -> None:
+        name = self.name_var.get().strip()
+        if not name:
+            messagebox.showerror("Invalid", "Camera name is required.")
+            return
+        if not self.existing and name in self.config.cameras:
+            messagebox.showerror("Invalid", f"A camera named '{name}' already exists.")
+            return
+
+        ip = self.ip_var.get().strip()
+        user = self.user_var.get().strip()
+        if not ip or not user:
+            messagebox.showerror("Invalid", "Camera IP and username are required.")
+            return
+
+        password = self.password_var.get()
+        if not password:
+            if self.existing:
+                password = self.existing.password
+            else:
+                messagebox.showerror("Invalid", "Password is required.")
+                return
+
+        try:
+            port = int(self.port_var.get())
+            channel = int(self.channel_var.get())
+        except ValueError:
+            messagebox.showerror("Invalid", "Port and channel must be numbers.")
+            return
+
+        camera = Camera(
+            name=name, ip=ip, port=port, user=user, password=password,
+            channel=channel, substream=(self.stream_var.get() == "sub"),
+        )
+        self.config.put_camera(camera)
+        self.config.save()
+        self.on_saved()
+        self.destroy()
+
+
+class RecordingDialog(tk.Toplevel):
+    def __init__(self, parent, config: Config, existing: Optional[Recording], on_saved):
+        super().__init__(parent)
+        self.config = config
+        self.existing = existing
+        self.on_saved = on_saved
+        self.title("Edit Recording" if existing else "Add Recording")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+
+        pad = {"padx": 6, "pady": 4}
+        self._row = 0
+
+        def add_row(label: str, widget) -> None:
+            ttk.Label(self, text=label).grid(row=self._row, column=0, sticky="e", **pad)
+            widget.grid(row=self._row, column=1, sticky="we", **pad)
+            self._row += 1
+
+        self.name_var = tk.StringVar(value=existing.name if existing else "")
+        name_entry = ttk.Entry(self, textvariable=self.name_var)
+        if existing:
+            name_entry.configure(state="disabled")
+        add_row("Recording name", name_entry)
+
+        camera_names = sorted(self.config.cameras)
+        default_camera = existing.camera_name if existing else (camera_names[0] if camera_names else "")
+        self.camera_var = tk.StringVar(value=default_camera)
+        camera_combo = ttk.Combobox(self, textvariable=self.camera_var, state="readonly", values=camera_names)
+        add_row("Camera", camera_combo)
+
         self.interval_var = tk.StringVar(value=str(existing.interval if existing else 30))
         self.interval_var.trace_add("write", self._update_interval_estimate)
 
@@ -372,7 +540,7 @@ class SetupDialog(tk.Toplevel):
                   foreground="gray").pack(anchor="w", pady=(2, 0))
         add_row("Seconds between frames", interval_container)
 
-        default_frames, default_output = default_setup_dirs(existing.name if existing else "setup")
+        default_frames, default_output = default_setup_dirs(existing.name if existing else "recording")
         self.frames_dir_var = tk.StringVar(
             value=existing.frames_dir if existing else str(default_frames)
         )
@@ -394,23 +562,34 @@ class SetupDialog(tk.Toplevel):
         sched = existing.schedule if existing else Schedule()
         self.schedule_mode_var = tk.StringVar(value=sched.mode)
         mode_frame = ttk.Frame(self)
-        ttk.Radiobutton(mode_frame, text="Daylight hours only", variable=self.schedule_mode_var,
-                         value="daylight", command=self._toggle_daylight_fields).pack(anchor="w")
-        ttk.Radiobutton(mode_frame, text="Always", variable=self.schedule_mode_var,
-                         value="always", command=self._toggle_daylight_fields).pack(anchor="w")
+        for label, value in [
+            ("Daylight hours", "daylight"),
+            ("Fixed daily time", "fixed_time"),
+            ("Timer (run for a set length)", "duration"),
+            ("Always", "always"),
+        ]:
+            ttk.Radiobutton(mode_frame, text=label, variable=self.schedule_mode_var,
+                             value=value, command=self._toggle_schedule_fields).pack(anchor="w")
         add_row("Schedule", mode_frame)
 
         self.lat_var = tk.StringVar(value="" if sched.latitude is None else str(sched.latitude))
-        self.lat_entry = ttk.Entry(self, textvariable=self.lat_var)
-        add_row("Latitude", self.lat_entry)
-
         self.lon_var = tk.StringVar(value="" if sched.longitude is None else str(sched.longitude))
-        self.lon_entry = ttk.Entry(self, textvariable=self.lon_var)
-        add_row("Longitude", self.lon_entry)
+        loc_frame = ttk.Frame(self)
+        self.lat_entry = ttk.Entry(loc_frame, textvariable=self.lat_var, width=11)
+        self.lat_entry.pack(side="left")
+        self.lon_entry = ttk.Entry(loc_frame, textvariable=self.lon_var, width=11)
+        self.lon_entry.pack(side="left", padx=(4, 4))
+        self.map_btn = ttk.Button(loc_frame, text="Pick on map...", command=self._open_map)
+        self.map_btn.pack(side="left")
+        add_row("Latitude / Longitude", loc_frame)
 
+        tz_frame = ttk.Frame(self)
         self.tz_var = tk.StringVar(value=sched.timezone or "")
-        self.tz_entry = ttk.Entry(self, textvariable=self.tz_var)
-        add_row("Timezone (e.g. America/New_York)", self.tz_entry)
+        self.tz_combo = ttk.Combobox(tz_frame, textvariable=self.tz_var, width=26, values=_TIMEZONES)
+        self.tz_combo.pack(side="left")
+        self.tz_detect_btn = ttk.Button(tz_frame, text="Detect from PC", command=self._detect_timezone)
+        self.tz_detect_btn.pack(side="left", padx=4)
+        add_row("Timezone", tz_frame)
 
         self.pre_offset_var = tk.StringVar(value=str(sched.pre_offset_minutes))
         self.pre_entry = ttk.Entry(self, textvariable=self.pre_offset_var)
@@ -420,18 +599,47 @@ class SetupDialog(tk.Toplevel):
         self.post_entry = ttk.Entry(self, textvariable=self.post_offset_var)
         add_row("Minutes after sunset to stop", self.post_entry)
 
+        self.start_time_var = tk.StringVar(value=sched.start_time or "07:00")
+        self.start_time_entry = ttk.Entry(self, textvariable=self.start_time_var)
+        add_row("Start time (24h HH:MM)", self.start_time_entry)
+
+        self.end_time_var = tk.StringVar(value=sched.end_time or "19:00")
+        self.end_time_entry = ttk.Entry(self, textvariable=self.end_time_var)
+        add_row("End time (24h HH:MM)", self.end_time_entry)
+
+        self.duration_var = tk.StringVar(
+            value=str(sched.duration_minutes) if sched.duration_minutes else "60"
+        )
+        self.duration_entry = ttk.Entry(self, textvariable=self.duration_var)
+        add_row("Run for (minutes)", self.duration_entry)
+
+        self._daylight_widgets = [self.lat_entry, self.lon_entry, self.map_btn, self.pre_entry, self.post_entry]
+        self._tz_widgets = [self.tz_combo, self.tz_detect_btn]
+        self._fixed_widgets = [self.start_time_entry, self.end_time_entry]
+        self._duration_widgets = [self.duration_entry]
+
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=self._row, column=0, columnspan=2, pady=8)
         ttk.Button(btn_frame, text="Save", command=self._save).pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
 
-        self._toggle_daylight_fields()
+        self._toggle_schedule_fields()
         self._update_interval_estimate()
 
-    def _toggle_daylight_fields(self) -> None:
-        state = "normal" if self.schedule_mode_var.get() == "daylight" else "disabled"
-        for entry in (self.lat_entry, self.lon_entry, self.tz_entry, self.pre_entry, self.post_entry):
-            entry.configure(state=state)
+    def _toggle_schedule_fields(self) -> None:
+        mode = self.schedule_mode_var.get()
+        daylight_state = "normal" if mode == "daylight" else "disabled"
+        fixed_state = "normal" if mode == "fixed_time" else "disabled"
+        tz_state = "normal" if mode in ("daylight", "fixed_time") else "disabled"
+        duration_state = "normal" if mode == "duration" else "disabled"
+        for w in self._daylight_widgets:
+            w.configure(state=daylight_state)
+        for w in self._fixed_widgets:
+            w.configure(state=fixed_state)
+        for w in self._tz_widgets:
+            w.configure(state=tz_state)
+        for w in self._duration_widgets:
+            w.configure(state=duration_state)
 
     def _update_interval_estimate(self, *_args) -> None:
         try:
@@ -453,35 +661,38 @@ class SetupDialog(tk.Toplevel):
         if path:
             var.set(path)
 
+    def _open_map(self) -> None:
+        LocationMapDialog(self, self.lat_var, self.lon_var)
+
+    def _detect_timezone(self) -> None:
+        try:
+            name = tzlocal.get_localzone_name()
+        except Exception as e:
+            messagebox.showerror("Detect timezone", f"Couldn't detect the PC's timezone: {e}")
+            return
+        if not name:
+            messagebox.showerror("Detect timezone", "Couldn't detect the PC's timezone.")
+            return
+        self.tz_var.set(name)
+
     def _save(self) -> None:
         name = self.name_var.get().strip()
         if not name:
-            messagebox.showerror("Invalid", "Setup name is required.")
+            messagebox.showerror("Invalid", "Recording name is required.")
             return
-        if not self.existing and name in self.config.setups:
-            messagebox.showerror("Invalid", f"A setup named '{name}' already exists.")
-            return
-
-        ip = self.ip_var.get().strip()
-        user = self.user_var.get().strip()
-        if not ip or not user:
-            messagebox.showerror("Invalid", "Camera IP and username are required.")
+        if not self.existing and name in self.config.recordings:
+            messagebox.showerror("Invalid", f"A recording named '{name}' already exists.")
             return
 
-        password = self.password_var.get()
-        if not password:
-            if self.existing:
-                password = self.existing.password
-            else:
-                messagebox.showerror("Invalid", "Password is required.")
-                return
+        camera_name = self.camera_var.get().strip()
+        if not camera_name or camera_name not in self.config.cameras:
+            messagebox.showerror("Invalid", "Select a camera.")
+            return
 
         try:
-            port = int(self.port_var.get())
-            channel = int(self.channel_var.get())
             interval = float(self.interval_var.get())
         except ValueError:
-            messagebox.showerror("Invalid", "Port, channel, and interval must be numbers.")
+            messagebox.showerror("Invalid", "Seconds between frames must be a number.")
             return
 
         default_frames, default_output = default_setup_dirs(name)
@@ -489,19 +700,19 @@ class SetupDialog(tk.Toplevel):
         output_dir = self.output_dir_var.get().strip() or str(default_output)
 
         mode = self.schedule_mode_var.get()
-        # Parse regardless of mode so switching to "Always" and saving doesn't
-        # discard already-entered coordinates -- switching back to "Daylight
-        # hours" later (even in a future edit session) won't require re-typing.
+        # Parse every schedule field regardless of the active mode so
+        # switching modes and saving never discards already-entered values --
+        # switching back later (even in a future edit) won't require re-typing.
         latitude = _parse_optional_float(self.lat_var.get())
         longitude = _parse_optional_float(self.lon_var.get())
         timezone = self.tz_var.get().strip() or None
         pre_offset = _parse_optional_int(self.pre_offset_var.get())
         post_offset = _parse_optional_int(self.post_offset_var.get())
+        start_time = self.start_time_var.get().strip() or None
+        end_time = self.end_time_var.get().strip() or None
+        duration_minutes = _parse_optional_int_or_none(self.duration_var.get())
 
-        if mode == "daylight":
-            if latitude is None or longitude is None:
-                messagebox.showerror("Invalid", "Latitude and longitude are required for daylight-hours scheduling.")
-                return
+        if mode in ("daylight", "fixed_time"):
             if not timezone or not is_valid_timezone(timezone):
                 messagebox.showerror(
                     "Invalid timezone",
@@ -509,26 +720,146 @@ class SetupDialog(tk.Toplevel):
                     f"e.g. America/New_York, Europe/London, Asia/Tokyo.",
                 )
                 return
+        if mode == "daylight":
+            if latitude is None or longitude is None:
+                messagebox.showerror("Invalid", "Latitude and longitude are required for daylight-hours scheduling.")
+                return
+        elif mode == "fixed_time":
+            if not start_time or not _valid_hhmm(start_time) or not end_time or not _valid_hhmm(end_time):
+                messagebox.showerror("Invalid", "Start and end time must be in 24h HH:MM form, e.g. 07:00.")
+                return
+        elif mode == "duration":
+            if not duration_minutes or duration_minutes <= 0:
+                messagebox.showerror("Invalid", "Enter how many minutes to run for.")
+                return
 
         schedule = Schedule(
-            mode=mode, latitude=latitude, longitude=longitude,
-            timezone=timezone, pre_offset_minutes=pre_offset, post_offset_minutes=post_offset,
+            mode=mode, latitude=latitude, longitude=longitude, timezone=timezone,
+            pre_offset_minutes=pre_offset, post_offset_minutes=post_offset,
+            start_time=start_time, end_time=end_time, duration_minutes=duration_minutes,
         )
 
-        setup = Setup(
-            name=name, ip=ip, port=port, user=user, password=password,
-            channel=channel, substream=(self.stream_var.get() == "sub"),
-            interval=interval, frames_dir=frames_dir, output_dir=output_dir,
-            schedule=schedule,
+        recording = Recording(
+            name=name, camera_name=camera_name, interval=interval,
+            frames_dir=frames_dir, output_dir=output_dir, schedule=schedule,
         )
-        self.config.put(setup)
+        self.config.put_recording(recording)
         self.config.save()
         self.on_saved()
         self.destroy()
 
 
+# Simplified continental-US outline (lon, lat), hand-picked for a rough
+# clickable reference shape -- not survey-accurate. The numeric lat/lon
+# fields remain editable afterward for fine-tuning.
+US_OUTLINE = [
+    (-124.7, 48.4), (-124.1, 44.6), (-123.0, 39.5), (-122.5, 37.8), (-120.5, 34.5), (-117.2, 32.7),
+    (-114.7, 32.7), (-111.0, 31.3), (-108.2, 31.3), (-106.5, 31.8), (-104.9, 29.5), (-99.5, 26.4), (-97.4, 25.9),
+    (-97.2, 27.8), (-95.3, 28.9), (-93.8, 29.7), (-90.0, 29.1), (-89.0, 30.3), (-87.2, 30.4),
+    (-85.0, 29.7), (-83.0, 29.6), (-82.6, 27.8), (-81.8, 25.2), (-80.1, 25.8),
+    (-80.5, 28.5), (-81.4, 30.3), (-79.9, 32.8), (-77.9, 34.2), (-76.0, 36.9), (-75.5, 38.8),
+    (-74.0, 40.6), (-71.0, 41.5), (-70.2, 43.7), (-67.0, 44.8),
+    (-71.5, 45.0), (-79.0, 43.3), (-83.5, 45.8), (-84.5, 46.5), (-89.5, 48.0), (-95.2, 49.0),
+    (-104.0, 49.0), (-114.0, 49.0), (-117.0, 49.0),
+]
+
+_MAP_LON_RANGE = (-125.0, -66.9)
+_MAP_LAT_RANGE = (24.5, 49.5)
+_MAP_SIZE = (560, 340)
+_MAP_PAD = 10
+
+
+class LocationMapDialog(tk.Toplevel):
+    def __init__(self, parent, lat_var: tk.StringVar, lon_var: tk.StringVar):
+        super().__init__(parent)
+        self.lat_var = lat_var
+        self.lon_var = lon_var
+        self.title("Pick a location")
+        self.resizable(False, False)
+        self.transient(parent)
+        self.grab_set()
+        self._pending: Optional[tuple] = None
+        self._marker = None
+
+        ttk.Label(
+            self, text="Click roughly where the camera is -- you can fine-tune "
+                       "the latitude/longitude afterward."
+        ).pack(padx=8, pady=(8, 4))
+
+        width, height = _MAP_SIZE
+        self.canvas = tk.Canvas(
+            self, width=width, height=height, background="#dbe9f4",
+            highlightthickness=1, highlightbackground="#888888",
+        )
+        self.canvas.pack(padx=8, pady=4)
+        self.canvas.bind("<Button-1>", self._on_click)
+
+        points = []
+        for lon, lat in US_OUTLINE:
+            x, y = self._project(lon, lat)
+            points.extend([x, y])
+        self.canvas.create_polygon(points, fill="#f0dfb4", outline="#8b7355", width=2)
+
+        self.coord_var = tk.StringVar(value="")
+        ttk.Label(self, textvariable=self.coord_var).pack(pady=(0, 4))
+
+        lat = _parse_optional_float(lat_var.get())
+        lon = _parse_optional_float(lon_var.get())
+        if lat is not None and lon is not None:
+            x, y = self._project(lon, lat)
+            self._draw_marker(x, y)
+            self.coord_var.set(f"{lat:.4f}, {lon:.4f}")
+            self._pending = (lat, lon)
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(pady=(0, 8))
+        ttk.Button(btn_frame, text="Use this location", command=self._confirm).pack(side="left", padx=4)
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side="left", padx=4)
+
+    def _project(self, lon: float, lat: float) -> tuple:
+        lon_min, lon_max = _MAP_LON_RANGE
+        lat_min, lat_max = _MAP_LAT_RANGE
+        width, height = _MAP_SIZE
+        x = _MAP_PAD + (lon - lon_min) / (lon_max - lon_min) * (width - 2 * _MAP_PAD)
+        y = _MAP_PAD + (lat_max - lat) / (lat_max - lat_min) * (height - 2 * _MAP_PAD)
+        return x, y
+
+    def _unproject(self, x: float, y: float) -> tuple:
+        lon_min, lon_max = _MAP_LON_RANGE
+        lat_min, lat_max = _MAP_LAT_RANGE
+        width, height = _MAP_SIZE
+        lon = lon_min + (x - _MAP_PAD) / (width - 2 * _MAP_PAD) * (lon_max - lon_min)
+        lat = lat_max - (y - _MAP_PAD) / (height - 2 * _MAP_PAD) * (lat_max - lat_min)
+        return lat, lon
+
+    def _draw_marker(self, x: float, y: float) -> None:
+        if self._marker is not None:
+            self.canvas.delete(self._marker)
+        r = 5
+        self._marker = self.canvas.create_oval(
+            x - r, y - r, x + r, y + r, fill="#c0392b", outline="black"
+        )
+
+    def _on_click(self, event) -> None:
+        lat, lon = self._unproject(event.x, event.y)
+        lat = max(min(lat, 90.0), -90.0)
+        lon = max(min(lon, 180.0), -180.0)
+        self._draw_marker(event.x, event.y)
+        self.coord_var.set(f"{lat:.4f}, {lon:.4f}")
+        self._pending = (lat, lon)
+
+    def _confirm(self) -> None:
+        if self._pending is None:
+            messagebox.showinfo("Pick a location", "Click a point on the map first.")
+            return
+        lat, lon = self._pending
+        self.lat_var.set(f"{lat:.4f}")
+        self.lon_var.set(f"{lon:.4f}")
+        self.destroy()
+
+
 class BuildDialog(tk.Toplevel):
-    def __init__(self, parent, setup: Setup, log):
+    def __init__(self, parent, setup, log):
         super().__init__(parent)
         self.setup = setup
         self.log = log
