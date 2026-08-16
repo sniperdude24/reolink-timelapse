@@ -1,13 +1,16 @@
-# Captured frames and rendered videos
+# Captured frames and rendered videos (default locations)
 frames/
 *.mp4
 
 # Python
 __pycache__/
 *.pyc
+*.egg-info/
+build/
+dist/
 .venv/
 venv/
 
-# Secrets / local config
+# Config lives in the OS user-config dir, not the repo, but just in case
+config.yaml
 .env
-config.local.*

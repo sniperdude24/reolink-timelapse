@@ -1,39 +1,95 @@
 # reolink-timelapse
 
-Pulls RTSP video from a Reolink IP camera (in parallel with your NVR's own recording) and grabs one frame every N seconds, so you can stitch them into a timelapse video later.
+Records RTSP frames from an IP camera (Reolink or otherwise) in parallel with
+your NVR's own recording, only during daylight hours, and stitches them into
+a timelapse video. Built to drive any number of independent camera setups —
+different cameras, different locations, different schedules — from one
+config-driven install rather than a one-off script per camera.
 
 ## Requirements
 
-- Python 3.8+
+- Python 3.9+
 - [ffmpeg](https://www.gyan.dev/ffmpeg/builds/) on your PATH (`ffmpeg -version` should work)
 
-## Usage
-
-Grab a frame every 30 seconds:
+## Install
 
 ```bash
-python timelapse_recorder.py --ip 192.168.1.50 --user admin --password mypass
+pip install -r requirements.txt
 ```
 
-Grab a frame every 5 seconds instead:
+(or `pip install -e .` to also get the `reolink-timelapse` command on your PATH)
+
+## Quick start
+
+Add a setup — this walks you through camera connection details, where to
+store frames/videos, and the capture schedule, then saves it under a name
+you choose:
 
 ```bash
-python timelapse_recorder.py --ip 192.168.1.50 --user admin --password mypass --interval 5
+python -m reolink_timelapse configure backyard
 ```
 
-Record, then build the timelapse video at 24fps:
+Start capturing (long-running — leave it running, e.g. in a scheduled task
+or a terminal you don't close):
 
 ```bash
-python timelapse_recorder.py --ip 192.168.1.50 --user admin --password mypass --build --output-fps 24
+python -m reolink_timelapse run backyard
 ```
 
-Just build a video from frames you already grabbed (no recording):
+Build a video from what's been captured so far:
 
 ```bash
-python timelapse_recorder.py --build-only --output-fps 30 --frames-dir frames
+python -m reolink_timelapse build backyard --output-fps 24
 ```
 
-## Notes
+Build just one day's video:
 
-- `--password` is passed on the command line, which means it's visible in shell history and process listings (e.g. Task Manager's command-line column). Fine for personal/local use; avoid on a shared machine.
-- Frames are named by timestamp (`%Y%m%d_%H%M%S.jpg`), so they sort chronologically for free.
+```bash
+python -m reolink_timelapse build backyard --date 2026-08-15
+```
+
+List or remove setups:
+
+```bash
+python -m reolink_timelapse list
+python -m reolink_timelapse remove backyard
+```
+
+If you installed with `pip install -e .`, drop the `python -m reolink_timelapse`
+prefix and just run `reolink-timelapse configure backyard`, etc.
+
+## How scheduling works
+
+Each setup can run in one of two modes (chosen during `configure`):
+
+- **Daylight hours** (recommended for outdoor timelapses): give a
+  latitude/longitude and IANA timezone name (e.g. `America/New_York`) once,
+  and the tool computes that day's actual sunrise/sunset every day via the
+  `astral` library — no network calls, no API keys. Optional pre/post offset
+  minutes widen the window (e.g. start 30 min before sunrise). The window
+  automatically shifts with the seasons.
+- **Always**: capture runs continuously with no schedule.
+
+`run <name>` is meant to be left running long-term: outside the capture
+window it sleeps until the next window start, and if ffmpeg exits
+unexpectedly mid-window (camera reboot, network blip) it waits 30s and
+retries automatically rather than giving up.
+
+## Where things are stored
+
+- **Config** (camera credentials, per-setup schedule) lives in your OS user
+  config dir — `%APPDATA%\reolink-timelapse\config.yaml` on Windows,
+  `~/.config/reolink-timelapse/config.yaml` elsewhere — not inside this repo,
+  so it's never at risk of being committed.
+- **Frames and finished videos** default to `~/Timelapses/<setup-name>/`,
+  configurable per setup during `configure`.
+
+## Notes / known limitations
+
+- Passwords are stored in the config file in plaintext (file permissions are
+  set to owner-only on macOS/Linux; Windows relies on your user account's
+  normal file ACLs). Fine for personal/local use. OS keychain storage via
+  `keyring` is a reasonable future improvement if this needs to be more
+  robust.
+- Frames are named by timestamp (`%Y%m%d_%H%M%S.jpg`), so they sort
+  chronologically for free and `build --date` can filter by day.
