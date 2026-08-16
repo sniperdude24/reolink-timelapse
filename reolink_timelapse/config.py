@@ -1,14 +1,16 @@
 """Persistent, multi-setup configuration.
 
-Config lives outside the repo/working directory (an OS-appropriate user
-config dir) so the same install can drive any number of camera setups
-without editing files by hand, and so credentials never end up committed
-to git by accident.
+Config, frames, and videos all default to living inside one "program
+folder" -- the running .exe's own folder when packaged, or the repo root
+when running from source -- so a whole install (app + settings + captured
+media) can be copied to another machine or a USB drive as a single unit.
+Per-setup frames_dir/output_dir can still be pointed elsewhere.
 """
 
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
@@ -26,7 +28,34 @@ def is_valid_timezone(name: str) -> bool:
         return False
 
 
+def app_root_dir() -> Path:
+    """The single "program folder" config.yaml and Timelapses/ default into.
+
+    Frozen (.exe): the exe's own folder -- mirrors rtsp.resolve_ffmpeg()'s
+    frozen check. Source run: the repo/install root, two levels up from
+    this file.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
+
+
+def default_setup_dirs(name: str) -> tuple[Path, Path]:
+    """Default (frames_dir, output_dir) for a new setup, under the program
+    folder's Timelapses/<name>/. The one place this is computed -- used by
+    both the CLI wizard and the GUI's Add/Edit dialog."""
+    base = app_root_dir() / "Timelapses" / name
+    return base / "frames", base
+
+
 def default_config_path() -> Path:
+    return app_root_dir() / "config.yaml"
+
+
+def _legacy_config_path() -> Path:
+    """Where config.yaml lived before config/data moved into the program
+    folder (the OS user config dir). Kept only so Config.load() can
+    migrate an existing install's config forward automatically."""
     if sys.platform == "win32":
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
@@ -74,9 +103,12 @@ class Config:
     def __init__(self, path: Optional[Path] = None):
         self.path = path or default_config_path()
         self.setups: dict[str, Setup] = {}
+        self.migrated_from: Optional[Path] = None
+        self.migration_error: Optional[str] = None
         self.load()
 
     def load(self) -> None:
+        self._migrate_legacy_config()
         if not self.path.exists():
             return
         with open(self.path, "r", encoding="utf-8") as f:
@@ -85,6 +117,31 @@ class Config:
             name: Setup.from_dict(name, data)
             for name, data in (raw.get("setups") or {}).items()
         }
+
+    def _migrate_legacy_config(self) -> None:
+        # Never migrate under a caller-supplied path (e.g. tests) -- only
+        # the real default location gets the one-time upgrade treatment.
+        if self.path.exists() or self.path != default_config_path():
+            return
+        legacy = _legacy_config_path()
+        if not legacy.exists() or legacy == self.path:
+            return
+        try:
+            with open(legacy, "r", encoding="utf-8") as f:
+                yaml.safe_load(f)  # validate before trusting it
+        except Exception as e:
+            self.migration_error = (
+                f"Found an old config at {legacy} but couldn't read it ({e}); left it in place."
+            )
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(legacy, self.path)
+            self.migrated_from = legacy
+        except OSError as e:
+            self.migration_error = (
+                f"Found an old config at {legacy} but couldn't copy it to {self.path} ({e})."
+            )
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

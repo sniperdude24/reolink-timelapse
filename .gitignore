@@ -2,6 +2,9 @@
 frames/
 *.mp4
 
+# Program-folder-relative defaults for source runs (see config.app_root_dir)
+/Timelapses/
+
 # Python
 __pycache__/
 *.pyc
@@ -14,6 +17,7 @@ reolink-timelapse-gui-win64-*.zip
 .venv/
 venv/
 
-# Config lives in the OS user-config dir, not the repo, but just in case
+# Config defaults into the program folder for source runs too (holds
+# camera credentials -- never commit it)
 config.yaml
 .env

@@ -22,21 +22,23 @@ Build it yourself:
 .\build_exe.ps1
 ```
 
-(needs ffmpeg on PATH *at build time only*, to copy into the bundle — neither
-resulting exe needs it afterward). This produces two self-contained builds,
-each with Python and ffmpeg bundled inside so they run with nothing else
-installed — zip either folder up and it runs anywhere:
+(needs ffmpeg on PATH *at build time only*, to copy into the bundle — the
+result doesn't need it afterward). This produces **one** self-contained
+folder, `dist\reolink-timelapse\`, holding both exes plus a single shared
+`ffmpeg.exe` — zip the whole folder up and it runs anywhere, with config,
+frames, and videos also defaulting to inside that same folder (see
+[Where things are stored](#where-things-are-stored)):
 
-- **`dist\reolink-timelapse-gui\reolink-timelapse-gui.exe`** — double-click
-  for the graphical control panel: add/edit/remove setups, start/stop
-  capture, see live status and log output, and build videos, all from one
-  window. No terminal needed. This is the one to hand to someone who isn't
-  going to use a command line.
-- **`dist\reolink-timelapse\reolink-timelapse.exe`** — the command-line
-  version below, for scripting or a headless setup (e.g. a server you SSH
-  into to check on it).
+- **`reolink-timelapse-gui.exe`** — double-click for the graphical control
+  panel: add/edit/remove setups, start/stop capture, see live status and log
+  output, and build videos, all from one window. No terminal needed. This is
+  the one to hand to someone who isn't going to use a command line.
+- **`reolink-timelapse.exe`** — the command-line version below, for
+  scripting or a headless setup (e.g. a server you SSH into to check on it).
 
-CLI usage is identical to the Python CLI below, just swap the command:
+Both read/write the same `config.yaml` in that folder, so setups created in
+one show up in the other. CLI usage is identical to the Python CLI below,
+just swap the command:
 
 ```powershell
 .\dist\reolink-timelapse\reolink-timelapse.exe configure backyard
@@ -134,13 +136,27 @@ per-session folders existed) unless you filter by date.
 
 ## Where things are stored
 
-- **Config** (camera credentials, per-setup schedule) lives in your OS user
-  config dir — `%APPDATA%\reolink-timelapse\config.yaml` on Windows,
-  `~/.config/reolink-timelapse/config.yaml` elsewhere — not inside this repo,
-  so it's never at risk of being committed.
-- **Frames** default to `~/Timelapses/<setup-name>/frames/<session>/`, and
-  **finished videos** to `~/Timelapses/<setup-name>/`, both configurable per
-  setup during `configure`.
+Config, frames, and videos all default into one **program folder** — the
+exe's own folder for the packaged build, or the repo root for a source run
+— so a whole install (app + settings + captured media) can be copied to
+another machine or a USB drive as a single unit:
+
+- **Config** (camera credentials, per-setup schedule) defaults to
+  `config.yaml` in the program folder. If you're upgrading from an older
+  version, the first run automatically migrates forward any existing config
+  it finds in the old location (`%APPDATA%\reolink-timelapse\config.yaml` on
+  Windows, `~/.config/reolink-timelapse/config.yaml` elsewhere) — nothing
+  already configured gets lost.
+- **Frames** default to `<program folder>\Timelapses\<setup-name>\frames\<session>\`,
+  and **finished videos** to `<program folder>\Timelapses\<setup-name>\`.
+
+Both are just defaults, suggested during `configure`/the GUI's Add Setup
+dialog — point `frames_dir`/`output_dir` at a separate drive per setup if
+you'd rather keep media outside the program folder.
+
+Note for source runs: `config.yaml` (which holds plaintext camera
+credentials) ends up sitting directly in the repo working directory. It's
+gitignored, but worth knowing if that repo checkout isn't otherwise private.
 
 ## Notes / known limitations
 

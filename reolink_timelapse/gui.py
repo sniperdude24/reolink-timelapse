@@ -13,7 +13,7 @@ from tkinter import filedialog, messagebox, ttk
 from typing import Optional
 
 from .build import build_timelapse
-from .config import Config, Schedule, Setup, is_valid_timezone
+from .config import Config, Schedule, Setup, default_setup_dirs, is_valid_timezone
 from .scheduler import run_scheduled
 
 
@@ -36,6 +36,10 @@ class App:
         self._closed = False
 
         self._build_widgets()
+        if self.config.migrated_from:
+            self.log(f"Migrated existing config from {self.config.migrated_from} to {self.config.path}.")
+        if self.config.migration_error:
+            self.log(f"WARNING: {self.config.migration_error}")
         self.refresh_list()
         self.root.after(200, self._drain_log_queue)
         self.root.after(1000, self._refresh_status_loop)
@@ -277,9 +281,9 @@ class SetupDialog(tk.Toplevel):
         self.interval_var = tk.StringVar(value=str(existing.interval if existing else 30))
         add_row("Seconds between frames", ttk.Entry(self, textvariable=self.interval_var))
 
-        default_base = Path.home() / "Timelapses" / (existing.name if existing else "setup")
+        default_frames, default_output = default_setup_dirs(existing.name if existing else "setup")
         self.frames_dir_var = tk.StringVar(
-            value=existing.frames_dir if existing else str(default_base / "frames")
+            value=existing.frames_dir if existing else str(default_frames)
         )
         frames_frame = ttk.Frame(self)
         ttk.Entry(frames_frame, textvariable=self.frames_dir_var, width=38).pack(side="left")
@@ -288,7 +292,7 @@ class SetupDialog(tk.Toplevel):
         add_row("Frames folder", frames_frame)
 
         self.output_dir_var = tk.StringVar(
-            value=existing.output_dir if existing else str(default_base)
+            value=existing.output_dir if existing else str(default_output)
         )
         output_frame = ttk.Frame(self)
         ttk.Entry(output_frame, textvariable=self.output_dir_var, width=38).pack(side="left")
@@ -373,8 +377,9 @@ class SetupDialog(tk.Toplevel):
             messagebox.showerror("Invalid", "Port, channel, and interval must be numbers.")
             return
 
-        frames_dir = self.frames_dir_var.get().strip() or str(Path.home() / "Timelapses" / name / "frames")
-        output_dir = self.output_dir_var.get().strip() or str(Path.home() / "Timelapses" / name)
+        default_frames, default_output = default_setup_dirs(name)
+        frames_dir = self.frames_dir_var.get().strip() or str(default_frames)
+        output_dir = self.output_dir_var.get().strip() or str(default_output)
 
         mode = self.schedule_mode_var.get()
         if mode == "daylight":

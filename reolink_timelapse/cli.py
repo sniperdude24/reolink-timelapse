@@ -3,9 +3,8 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import getpass
-from pathlib import Path
 
-from .config import Config, Setup, Schedule, is_valid_timezone
+from .config import Config, Setup, Schedule, default_setup_dirs, is_valid_timezone
 from .build import build_timelapse
 from .scheduler import run_scheduled
 
@@ -43,8 +42,17 @@ def _prompt_yes_no(label: str, default: bool) -> bool:
     return raw.startswith("y")
 
 
-def cmd_configure(args: argparse.Namespace) -> None:
+def _open_config() -> Config:
     config = Config()
+    if config.migrated_from:
+        print(f"(Migrated existing config from {config.migrated_from} to {config.path}.)\n")
+    if config.migration_error:
+        print(f"WARNING: {config.migration_error}\n")
+    return config
+
+
+def cmd_configure(args: argparse.Namespace) -> None:
+    config = _open_config()
     existing = config.setups.get(args.name)
 
     print(f"Configuring setup '{args.name}'" + (" (editing existing)" if existing else "") + "\n")
@@ -69,14 +77,14 @@ def cmd_configure(args: argparse.Namespace) -> None:
     )
     interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
 
-    default_base = Path.home() / "Timelapses" / args.name
+    default_frames, default_output = default_setup_dirs(args.name)
     frames_dir = _prompt(
         "Folder to save frames",
-        existing.frames_dir if existing else str(default_base / "frames"),
+        existing.frames_dir if existing else str(default_frames),
     )
     output_dir = _prompt(
         "Folder to save finished videos",
-        existing.output_dir if existing else str(default_base),
+        existing.output_dir if existing else str(default_output),
     )
 
     sched = existing.schedule if existing else Schedule()
@@ -128,7 +136,7 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
 
 def cmd_list(args: argparse.Namespace) -> None:
-    config = Config()
+    config = _open_config()
     if not config.setups:
         print("No setups configured yet. Run 'reolink-timelapse configure <name>' to add one.")
         return
@@ -140,7 +148,7 @@ def cmd_list(args: argparse.Namespace) -> None:
 
 
 def cmd_remove(args: argparse.Namespace) -> None:
-    config = Config()
+    config = _open_config()
     config.get(args.name)  # raises a clear error if missing
     config.remove(args.name)
     config.save()
@@ -148,13 +156,13 @@ def cmd_remove(args: argparse.Namespace) -> None:
 
 
 def cmd_run(args: argparse.Namespace) -> None:
-    config = Config()
+    config = _open_config()
     setup = config.get(args.name)
     run_scheduled(setup)
 
 
 def cmd_build(args: argparse.Namespace) -> None:
-    config = Config()
+    config = _open_config()
     setup = config.get(args.name)
     start_date = dt.date.fromisoformat(args.start_date) if args.start_date else None
     end_date = dt.date.fromisoformat(args.end_date) if args.end_date else None
