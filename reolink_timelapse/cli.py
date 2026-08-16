@@ -4,6 +4,7 @@ import argparse
 import datetime as dt
 import getpass
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from .config import Config, Setup, Schedule
 from .build import build_timelapse
@@ -23,6 +24,18 @@ def _prompt(label: str, default=None, cast=str):
             return cast(raw)
         except ValueError:
             print(f"  Please enter a valid {cast.__name__}.")
+
+
+def _prompt_timezone(label: str, default=None) -> str:
+    while True:
+        tz_name = _prompt(label, default)
+        try:
+            ZoneInfo(tz_name)
+            return tz_name
+        except ZoneInfoNotFoundError:
+            print(f"  '{tz_name}' isn't a recognized IANA timezone name. "
+                  f"Use the Region/City form, e.g. America/New_York, Europe/London, "
+                  f"Asia/Tokyo (full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).")
 
 
 def _prompt_yes_no(label: str, default: bool) -> bool:
@@ -77,7 +90,7 @@ def cmd_configure(args: argparse.Namespace) -> None:
     if daylight:
         latitude = _prompt("Latitude (e.g. 40.4406)", sched.latitude, float)
         longitude = _prompt("Longitude (e.g. -79.9959)", sched.longitude, float)
-        timezone = _prompt(
+        timezone = _prompt_timezone(
             "IANA timezone name (e.g. America/New_York)", sched.timezone
         )
         pre_offset = _prompt(
