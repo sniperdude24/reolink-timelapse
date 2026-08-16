@@ -9,6 +9,7 @@ __pycache__/
 build/
 dist/
 *.spec
+reolink-timelapse-win64-*.zip
 .venv/
 venv/
 
