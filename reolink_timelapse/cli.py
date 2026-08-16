@@ -5,9 +5,9 @@ import datetime as dt
 import getpass
 from typing import Optional
 
-from .config import Camera, Config, Recording, Schedule, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .build import build_timelapse
-from .scheduler import run_scheduled
+from .scheduler import daylight_window, run_scheduled
 
 
 def _prompt(label: str, default=None, cast=str):
@@ -95,6 +95,26 @@ def _prompt_schedule(existing: Optional[Schedule]) -> Schedule:
     return Schedule(mode="always")
 
 
+def _session_seconds_today(sched: Schedule) -> Optional[float]:
+    """Length of one capture session for today, or None when the schedule
+    has no defined length (always mode / bad daylight fields). Best-effort;
+    feeds the recommended-rate line only."""
+    if sched.mode == "duration":
+        return sched.duration_minutes * 60 if sched.duration_minutes else None
+    if sched.mode == "fixed_time":
+        delta = (dt.datetime.strptime(sched.end_time, "%H:%M")
+                 - dt.datetime.strptime(sched.start_time, "%H:%M")).total_seconds()
+        return delta if delta > 0 else delta + 86400  # overnight window
+    if sched.mode == "daylight":
+        try:
+            temp = Setup(name="", ip="", user="", password="", schedule=sched)
+            window = daylight_window(temp, dt.date.today())
+            return (window.end - window.start).total_seconds()
+        except Exception:
+            return None
+    return None
+
+
 def cmd_configure(args: argparse.Namespace) -> None:
     config = _open_config()
     existing = config.cameras.get(args.name)
@@ -168,6 +188,11 @@ def cmd_record(args: argparse.Namespace) -> None:
             if target_video_seconds > 0:
                 break
             print("  Length must be greater than 0.")
+        session_secs = _session_seconds_today(sched)
+        if session_secs:
+            rec = max(session_secs / (target_video_seconds * output_fps), 0.05)
+            print(f"  Recommended capture rate: 1 frame every {rec:.2f}s for today's "
+                  f"{session_secs / 3600:.1f}h window -- auto-adjusts each session.")
     else:
         while True:
             interval = _prompt("Seconds between frames", existing.interval if existing else 30, float)
@@ -240,6 +265,7 @@ def cmd_build(args: argparse.Namespace) -> None:
         output_file=args.output_file,
         start_date=start_date,
         end_date=end_date,
+        smooth_base_fps=args.smooth_fps,
     )
     print(f"\nDone! Saved to: {out}")
 
@@ -288,6 +314,10 @@ def main() -> None:
     p = sub.add_parser("build", help="Build an mp4 timelapse from captured frames")
     p.add_argument("name")
     p.add_argument("--output-fps", type=float, default=30, help="Playback fps (default: 30)")
+    p.add_argument("--smooth-fps", type=float, default=None,
+                    help="Motion-smooth the video: treat captured frames as this many "
+                         "real frames per second and interpolate in-between frames up "
+                         "to --output-fps (must be below it). Renders much slower.")
     p.add_argument("--output-file", default=None, help="Output path (default: auto-named)")
     p.add_argument("--date", default=None, help="Only include frames from this date (YYYY-MM-DD)")
     p.add_argument("--start-date", default=None, help="Only include frames on/after this date")

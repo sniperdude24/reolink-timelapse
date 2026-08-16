@@ -637,16 +637,33 @@ class RecordingDialog(tk.Toplevel):
         self.fps_var = tk.StringVar(value=f"{existing.output_fps:g}" if existing else "30")
         add_row("Output video fps", ttk.Entry(self, textvariable=self.fps_var, width=8))
 
+        self._recommended_interval: Optional[float] = None
         self.pacing_var = tk.StringVar(
             value="length" if (existing and existing.target_video_seconds) else "interval"
         )
         pacing_frame = ttk.Frame(self)
-        ttk.Radiobutton(pacing_frame, text="Interval between frames", variable=self.pacing_var,
-                         value="interval", command=self._toggle_pacing_fields).pack(anchor="w")
-        ttk.Radiobutton(pacing_frame, text="Target video length (interval auto-adjusts per session)",
+        ttk.Radiobutton(pacing_frame, text="Choose a video length (recommended rate is derived)",
                          variable=self.pacing_var,
                          value="length", command=self._toggle_pacing_fields).pack(anchor="w")
+        ttk.Radiobutton(pacing_frame, text="Set the frame interval manually", variable=self.pacing_var,
+                         value="interval", command=self._toggle_pacing_fields).pack(anchor="w")
         add_row("Set capture by", pacing_frame)
+
+        self.target_var = tk.StringVar(
+            value=str(existing.target_video_seconds) if (existing and existing.target_video_seconds) else "60"
+        )
+        target_frame = ttk.Frame(self)
+        self.target_entry = ttk.Entry(target_frame, textvariable=self.target_var, width=8)
+        self.target_entry.pack(side="left")
+        self.use_recommended_btn = ttk.Button(target_frame, text="Use as fixed interval",
+                                              command=self._use_recommended)
+        self.use_recommended_btn.pack(side="left", padx=6)
+        add_row("Target video length (seconds)", target_frame)
+
+        self.recommend_var = tk.StringVar(value="")
+        recommend_label = ttk.Label(self, textvariable=self.recommend_var)
+        recommend_label.grid(row=self._row, column=0, columnspan=2, sticky="w", padx=6)
+        self._row += 1
 
         self.interval_var = tk.StringVar(value=str(existing.interval if existing else 30))
         interval_container = ttk.Frame(self)
@@ -660,12 +677,6 @@ class RecordingDialog(tk.Toplevel):
             btn.pack(side="left", padx=2)
             self._interval_widgets.append(btn)
         add_row("Seconds between frames", interval_container)
-
-        self.target_var = tk.StringVar(
-            value=str(existing.target_video_seconds) if (existing and existing.target_video_seconds) else "60"
-        )
-        self.target_entry = ttk.Entry(self, textvariable=self.target_var, width=8)
-        add_row("Target video length (seconds)", self.target_entry)
 
         self.estimate_var = tk.StringVar(value="")
         estimate_label = ttk.Label(self, textvariable=self.estimate_var, foreground="gray")
@@ -768,7 +779,24 @@ class RecordingDialog(tk.Toplevel):
         for w in self._interval_widgets:
             w.configure(state="disabled" if length else "normal")
         self.target_entry.configure(state="normal" if length else "disabled")
+        self.use_recommended_btn.configure(state="normal" if length else "disabled")
         self._update_estimate()
+
+    def _use_recommended(self) -> None:
+        """Lock the currently recommended rate: copy it into the interval
+        field and switch to manual-interval pacing, so the recording stores
+        a plain fixed interval instead of auto-adjusting each session."""
+        self._update_estimate()
+        if self._recommended_interval is None:
+            messagebox.showinfo(
+                "Use as fixed interval",
+                "Enter a target video length first, with a schedule that has a "
+                "set session length (Daylight hours, Fixed daily time, or Timer).",
+            )
+            return
+        self.interval_var.set(f"{round(self._recommended_interval, 2):g}")
+        self.pacing_var.set("interval")
+        self._toggle_pacing_fields()
 
     def _session_seconds(self) -> Optional[float]:
         """Length of one capture session for the currently entered schedule,
@@ -804,32 +832,42 @@ class RecordingDialog(tk.Toplevel):
         return None  # "always"
 
     def _update_estimate(self, *_args) -> None:
+        self._recommended_interval = None
         try:
             fps = float(self.fps_var.get())
             if fps <= 0:
                 raise ValueError
         except ValueError:
+            self.recommend_var.set("")
             self.estimate_var.set("")
             return
         session_secs = self._session_seconds()
 
         if self.pacing_var.get() == "length":
+            self.estimate_var.set("")
             target = _parse_optional_int_or_none(self.target_var.get())
             if not target or target <= 0:
-                self.estimate_var.set("")
+                self.recommend_var.set("")
                 return
             if session_secs is None:
-                self.estimate_var.set(
-                    "Target length needs a schedule with a set session length (not Always)."
+                self.recommend_var.set(
+                    "Recommended rate needs a schedule with a set session length (not Always)."
                 )
                 return
             interval = max(session_secs / (target * fps), 0.05)
+            self._recommended_interval = interval
+            self.recommend_var.set(
+                f"Recommended: 1 frame every {interval:.2f}s "
+                f"(~{target * fps:,.0f} frames over a {session_secs / 3600:.1f}h session "
+                f"-> {target}s at {fps:g} fps)"
+            )
             self.estimate_var.set(
-                f"~1 frame every {interval:.2f}s over a {session_secs / 3600:.1f}h session "
-                f"-> {target}s video at {fps:g} fps"
+                "Saving keeps auto-adjust: the rate is re-derived from each session's "
+                "actual window. \"Use as fixed interval\" locks today's rate instead."
             )
             return
 
+        self.recommend_var.set("")
         try:
             interval = float(self.interval_var.get())
             if interval <= 0:
@@ -1114,11 +1152,27 @@ class BuildDialog(tk.Toplevel):
         self.fps_var = tk.StringVar(value=f"{setup.output_fps:g}")
         add_row("Output fps", ttk.Entry(self, textvariable=self.fps_var))
 
+        self.smooth_var = tk.BooleanVar(value=False)
+        self.base_fps_var = tk.StringVar(value="5")
+        smooth_frame = ttk.Frame(self)
+        ttk.Checkbutton(
+            smooth_frame, text="Smooth motion (interpolate in-between frames)",
+            variable=self.smooth_var, command=self._toggle_smooth,
+        ).pack(anchor="w")
+        base_row = ttk.Frame(smooth_frame)
+        base_row.pack(anchor="w")
+        ttk.Label(base_row, text="Real frames per second:").pack(side="left")
+        self.base_fps_entry = ttk.Entry(base_row, textvariable=self.base_fps_var, width=6)
+        self.base_fps_entry.pack(side="left", padx=4)
+        add_row("Smoothing", smooth_frame)
+
         self.est_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.est_var, foreground="gray").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=6)
         row += 1
         self.fps_var.trace_add("write", self._update_build_estimate)
+        self.base_fps_var.trace_add("write", self._update_build_estimate)
+        self._toggle_smooth()
 
         self.date_var = tk.StringVar(value="")
         add_row("Single date (YYYY-MM-DD, optional)", ttk.Entry(self, textvariable=self.date_var))
@@ -1168,6 +1222,10 @@ class BuildDialog(tk.Toplevel):
         self._scope_counts[ALL_SESSIONS] = total
         return sessions
 
+    def _toggle_smooth(self) -> None:
+        self.base_fps_entry.configure(state="normal" if self.smooth_var.get() else "disabled")
+        self._update_build_estimate()
+
     def _update_build_estimate(self, *_args) -> None:
         frames = self._scope_counts.get(self.scope_var.get(), 0)
         try:
@@ -1176,6 +1234,16 @@ class BuildDialog(tk.Toplevel):
                 raise ValueError
         except ValueError:
             self.est_var.set("")
+            return
+        if self.smooth_var.get():
+            base = _parse_optional_float(self.base_fps_var.get())
+            if not base or not 0 < base < fps:
+                self.est_var.set("Real frames per second must be above 0 and below the output fps.")
+                return
+            self.est_var.set(
+                f"~{frames / base:.1f}s of smoothed video from {frames} frames "
+                f"({base:g} real fps interpolated to {fps:g} fps) -- renders much slower"
+            )
             return
         self.est_var.set(f"~{frames / fps:.1f}s of video from {frames} frames at {fps:g} fps")
 
@@ -1193,20 +1261,34 @@ class BuildDialog(tk.Toplevel):
             messagebox.showerror("Invalid", "Check the fps/date fields (dates must be YYYY-MM-DD).")
             return
 
+        smooth_base_fps = None
+        if self.smooth_var.get():
+            smooth_base_fps = _parse_optional_float(self.base_fps_var.get())
+            if not smooth_base_fps or not 0 < smooth_base_fps < fps:
+                messagebox.showerror(
+                    "Invalid",
+                    "Real frames per second must be greater than 0 and less than "
+                    "the output fps.",
+                )
+                return
+
         scope = self.scope_var.get()
         frames_dir = next((path for label, path in self.sessions if label == scope), None)
 
         self.build_btn.configure(state="disabled")
         self.status_var.set("Building...")
-        self.log(f"Building video for '{self.setup.name}' ({scope})...")
+        self.log(f"Building video for '{self.setup.name}' ({scope})"
+                 + (" with motion smoothing..." if smooth_base_fps else "..."))
 
         self._result_queue: "queue.Queue[tuple]" = queue.Queue()
         threading.Thread(
-            target=self._worker, args=(fps, start_date, end_date, frames_dir), daemon=True
+            target=self._worker,
+            args=(fps, start_date, end_date, frames_dir, smooth_base_fps), daemon=True,
         ).start()
         self.after(100, self._poll_result)
 
-    def _worker(self, fps: float, start_date, end_date, frames_dir: Optional[str]) -> None:
+    def _worker(self, fps: float, start_date, end_date, frames_dir: Optional[str],
+                smooth_base_fps: Optional[float]) -> None:
         # Runs on a background thread -- must never touch Tk widgets directly,
         # only hand the result to the main thread via the queue. Calling
         # self.after() from here intermittently raised "main thread is not
@@ -1215,7 +1297,7 @@ class BuildDialog(tk.Toplevel):
         try:
             out = build_timelapse(
                 self.setup, output_fps=fps, start_date=start_date, end_date=end_date,
-                frames_dir=frames_dir,
+                frames_dir=frames_dir, smooth_base_fps=smooth_base_fps,
             )
             self._result_queue.put((out, None))
         except (SystemExit, Exception) as e:

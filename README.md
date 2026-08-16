@@ -151,18 +151,41 @@ Each recording has an **output video fps** (default 30) used for its
 automatically built session videos and pre-filled when building manually.
 Capture pacing works one of two ways:
 
-- **Interval between frames** (default): one frame every N seconds. The
-  Add/Edit Recording dialog shows a live estimate of how long the finished
-  video will come out for the current schedule, interval, and fps.
-- **Target video length**: set how long you want the finished video to be
-  (e.g. 60 seconds) and the interval is derived automatically — recomputed
-  at the start of every session from that day's actual window, so daylight
-  videos stay the target length even as sunrise/sunset drift with the
-  seasons. Needs a schedule with a defined session length (Daylight hours,
-  Fixed daily time, or Timer — not Always).
+- **Choose a video length**: set how long you want the finished video to
+  be (e.g. 60 seconds) and the dialog shows the **recommended capture
+  rate** live ("1 frame every 24.00s") for the current schedule and fps.
+  Saving keeps it auto-adjusting: the rate is re-derived at the start of
+  every session from that day's actual window, so daylight videos stay the
+  target length even as sunrise/sunset drift with the seasons. Or click
+  **"Use as fixed interval"** to lock today's recommended rate into the
+  interval field instead. Needs a schedule with a defined session length
+  (Daylight hours, Fixed daily time, or Timer — not Always).
+- **Set the interval manually**: one frame every N seconds. The dialog
+  shows a live estimate of how long the finished video will come out for
+  the current schedule, interval, and fps.
 
 The Build Video dialog also shows the estimated output length for whichever
 session (or the whole history) you've selected at the chosen fps.
+
+### Motion smoothing
+
+When building a video you can optionally **smooth motion** by having
+ffmpeg synthesize in-between frames (motion interpolation): tick "Smooth
+motion" in the Build Video dialog and set how many **real** frames play
+per second (e.g. 5). Each captured frame then anchors that much time and
+the gaps are filled with interpolated frames up to the output fps — so 60
+captured frames at 5 real fps become a fluid 12-second video at 30 fps,
+instead of a jerky 2-second one. From the CLI:
+
+```bash
+python -m reolink_timelapse build backyard --output-fps 30 --smooth-fps 5
+```
+
+Interpolation renders much slower than a plain build (motion estimation
+runs on every frame — expect minutes rather than seconds for 4K), and
+fast-moving objects can shimmer slightly where frames are synthesized.
+Automatic end-of-session builds stay plain; smoothing is a per-build
+choice.
 
 ## Sessions, folders, and videos
 
@@ -216,3 +239,12 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   robust.
 - Frames are named by timestamp (`%Y%m%d_%H%M%S.jpg`), so they sort
   chronologically for free and `build --date` can filter by day.
+- Two protections keep corrupted frames (green smears from a network or
+  camera hiccup) out of your timelapses. Frames ffmpeg flags as corrupt
+  are dropped instead of saved (`-fflags discardcorrupt`), and capture
+  intervals of 5 seconds or more save only **keyframes** — the
+  self-contained frames the camera sends every couple of seconds that
+  can't inherit smearing from earlier damage. Neither shortens your
+  videos: a slot just gets the next clean frame, at worst a couple of
+  seconds later. Intervals under 5s (including sub-second capture) still
+  save every frame, where a rare smeared frame can slip through.

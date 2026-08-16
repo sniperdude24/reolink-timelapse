@@ -21,6 +21,19 @@ Built for day+ unattended runs:
 - Decode uses -hwaccel auto: NVDEC/QSV/etc. when the machine has it
   (verified against the real camera -- 4K HEVC decode moves off the CPU),
   silent fallback to software when it doesn't.
+- Two layers against green-smear corruption (verified against a
+  deliberately damaged copy of the real stream): -fflags discardcorrupt
+  drops the packets/frames ffmpeg actually flags as corrupt, and -- the
+  layer that does the heavy lifting -- intervals of
+  KEYFRAME_SNAP_MIN_INTERVAL seconds or more save only keyframes
+  (I-frames). HEVC error concealment hands back smeared P-frames without
+  flagging them, and one hit smears every frame until the next keyframe;
+  keyframes reference nothing, so snapping to them cut visibly damaged
+  saves from 75/176 to 0/9 on the same damaged input. Spacing just rounds
+  up to the camera's keyframe cadence (~2s on Reolink). Shorter intervals
+  keep saving every frame -- sub-second capture still works. (-skip_frame
+  nokey would also skip the decode work, but this camera re-sends its PPS
+  mid-frame, which that path can't decode at all.)
 - Stop is graceful-first: ffmpeg's 'q' command via stdin lets it finish
   writing the current frame, so the last file of a session is never a
   truncated JPEG that then breaks the session's auto-build.
@@ -39,6 +52,7 @@ from .rtsp import build_rtsp_url, check_ffmpeg, no_console_kwargs
 
 STDERR_TAIL_LINES = 50
 GRACEFUL_STOP_TIMEOUT = 5
+KEYFRAME_SNAP_MIN_INTERVAL = 5  # seconds; at/above this, save keyframes only
 
 
 def _drain_stderr(proc: subprocess.Popen) -> None:
@@ -61,13 +75,18 @@ def start_capture_process(setup: Setup, session_dir: str) -> subprocess.Popen:
     rtsp_url = build_rtsp_url(setup)
     # \, -- comma is a filter-graph separator and must be escaped inside the
     # select expression.
-    thin_filter = f"select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,{setup.interval})"
+    spacing = f"isnan(prev_selected_t)+gte(t-prev_selected_t\\,{setup.interval})"
+    if setup.interval >= KEYFRAME_SNAP_MIN_INTERVAL:
+        thin_filter = f"select=eq(pict_type\\,I)*({spacing})"
+    else:
+        thin_filter = f"select={spacing}"
     run_start = dt.datetime.now()
     out_pattern = os.path.join(session_dir, f"{run_start:%Y%m%d_%H%M%S}_%06d.jpg")
 
     cmd = [
         ffmpeg_bin,
         "-loglevel", "error", "-nostats",
+        "-fflags", "discardcorrupt",
         "-hwaccel", "auto",
         "-rtsp_transport", "tcp",
         "-timeout", "10000000",  # 10s connect/read timeout (microseconds)

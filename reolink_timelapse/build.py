@@ -42,7 +42,16 @@ def build_timelapse(
     start_date: Optional[dt.date] = None,
     end_date: Optional[dt.date] = None,
     frames_dir: Optional[str] = None,
+    smooth_base_fps: Optional[float] = None,
 ) -> str:
+    # smooth_base_fps: motion-smoothed build. Captured frames play at this
+    # rate and minterpolate synthesizes the in-between frames up to
+    # output_fps, so sparse captures come out fluid instead of jerky (and
+    # proportionally longer). Must be > 0 and < output_fps. Rendering is
+    # much slower than a plain build -- motion estimation on every frame.
+    if smooth_base_fps is not None and not 0 < smooth_base_fps < output_fps:
+        sys.exit("ERROR: smoothing base fps must be greater than 0 and "
+                 "less than the output fps.")
     ffmpeg_bin = check_ffmpeg()
     frames_dir = frames_dir or setup.frames_dir
     if not os.path.isdir(frames_dir):
@@ -74,18 +83,35 @@ def build_timelapse(
             escaped = abs_path.replace("'", "'\\''")
             f.write(f"file '{escaped}'\n")
 
+    if smooth_base_fps is not None:
+        # Real frames anchor at the base rate; minterpolate (motion-
+        # compensated, with its default scene-change detection so big jumps
+        # get duplicated rather than morphed) fills up to output_fps.
+        # deflicker stays first so it runs on real frames only.
+        input_fps = smooth_base_fps
+        vf = (f"deflicker,minterpolate=fps={output_fps}:mi_mode=mci:"
+              f"mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+    else:
+        input_fps = output_fps
+        vf = "deflicker"
+
     cmd = [
         ffmpeg_bin, "-y",
         "-f", "concat", "-safe", "0",
-        "-r", str(output_fps),
+        "-r", str(input_fps),
         "-i", list_path,
-        "-vf", "deflicker",
+        "-vf", vf,
         "-c:v", "libx264",
         "-pix_fmt", "yuv420p",
         output_file,
     ]
 
-    print(f"Building timelapse at {output_fps} fps from {len(frame_paths)} frames...")
+    if smooth_base_fps is not None:
+        print(f"Building motion-smoothed timelapse from {len(frame_paths)} frames "
+              f"({smooth_base_fps:g} real fps interpolated up to {output_fps:g} fps) -- "
+              f"this renders much slower than a plain build...")
+    else:
+        print(f"Building timelapse at {output_fps} fps from {len(frame_paths)} frames...")
     try:
         subprocess.run(cmd, check=True, **no_console_kwargs())
     except subprocess.CalledProcessError as e:
