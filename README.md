@@ -16,19 +16,27 @@ its own Python and ffmpeg.
 
 ## Standalone .exe (Windows)
 
-`dist\reolink-timelapse\reolink-timelapse.exe` is a self-contained build —
-Python and ffmpeg are both bundled inside the `dist\reolink-timelapse\`
-folder, so it runs with nothing else installed. Build it yourself:
+Build it yourself:
 
 ```powershell
 .\build_exe.ps1
 ```
 
-(needs ffmpeg on PATH *at build time only*, to copy into the bundle — the
-resulting exe doesn't need it afterward). This produces `dist\reolink-timelapse\`,
-which is the whole distributable — zip that folder up and it'll run anywhere.
+(needs ffmpeg on PATH *at build time only*, to copy into the bundle — neither
+resulting exe needs it afterward). This produces two self-contained builds,
+each with Python and ffmpeg bundled inside so they run with nothing else
+installed — zip either folder up and it runs anywhere:
 
-Usage is identical to the Python CLI below, just swap the command:
+- **`dist\reolink-timelapse-gui\reolink-timelapse-gui.exe`** — double-click
+  for the graphical control panel: add/edit/remove setups, start/stop
+  capture, see live status and log output, and build videos, all from one
+  window. No terminal needed. This is the one to hand to someone who isn't
+  going to use a command line.
+- **`dist\reolink-timelapse\reolink-timelapse.exe`** — the command-line
+  version below, for scripting or a headless setup (e.g. a server you SSH
+  into to check on it).
+
+CLI usage is identical to the Python CLI below, just swap the command:
 
 ```powershell
 .\dist\reolink-timelapse\reolink-timelapse.exe configure backyard
@@ -82,6 +90,13 @@ python -m reolink_timelapse remove backyard
 
 If you installed with `pip install -e .`, drop the `python -m reolink_timelapse`
 prefix and just run `reolink-timelapse configure backyard`, etc.
+
+Or skip the individual commands and use the graphical control panel instead
+(same underlying engine, just a window instead of a terminal):
+
+```bash
+python -m reolink_timelapse gui
+```
 
 ## How scheduling works
 

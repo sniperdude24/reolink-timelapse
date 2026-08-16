@@ -13,8 +13,17 @@ import sys
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import yaml
+
+
+def is_valid_timezone(name: str) -> bool:
+    try:
+        ZoneInfo(name)
+        return True
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
 
 
 def default_config_path() -> Path:

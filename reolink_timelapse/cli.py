@@ -4,9 +4,8 @@ import argparse
 import datetime as dt
 import getpass
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .config import Config, Setup, Schedule
+from .config import Config, Setup, Schedule, is_valid_timezone
 from .build import build_timelapse
 from .scheduler import run_scheduled
 
@@ -29,13 +28,11 @@ def _prompt(label: str, default=None, cast=str):
 def _prompt_timezone(label: str, default=None) -> str:
     while True:
         tz_name = _prompt(label, default)
-        try:
-            ZoneInfo(tz_name)
+        if is_valid_timezone(tz_name):
             return tz_name
-        except ZoneInfoNotFoundError:
-            print(f"  '{tz_name}' isn't a recognized IANA timezone name. "
-                  f"Use the Region/City form, e.g. America/New_York, Europe/London, "
-                  f"Asia/Tokyo (full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).")
+        print(f"  '{tz_name}' isn't a recognized IANA timezone name. "
+              f"Use the Region/City form, e.g. America/New_York, Europe/London, "
+              f"Asia/Tokyo (full list: https://en.wikipedia.org/wiki/List_of_tz_database_time_zones).")
 
 
 def _prompt_yes_no(label: str, default: bool) -> bool:
@@ -173,6 +170,11 @@ def cmd_build(args: argparse.Namespace) -> None:
     print(f"\nDone! Saved to: {out}")
 
 
+def cmd_gui(args: argparse.Namespace) -> None:
+    from .gui import main as gui_main
+    gui_main()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         prog="reolink-timelapse",
@@ -195,6 +197,9 @@ def main() -> None:
     p = sub.add_parser("run", help="Start capturing frames for a setup (long-running)")
     p.add_argument("name")
     p.set_defaults(func=cmd_run)
+
+    p = sub.add_parser("gui", help="Launch the graphical control panel")
+    p.set_defaults(func=cmd_gui)
 
     p = sub.add_parser("build", help="Build an mp4 timelapse from captured frames")
     p.add_argument("name")
