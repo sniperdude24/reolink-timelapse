@@ -34,6 +34,7 @@ from __future__ import annotations
 import os
 import subprocess
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -52,6 +53,7 @@ LIVE_SPEEDUP = 60           # 5 min of real time -> ~5s of video
 LIVE_OUTPUT_FPS = 60        # with 60x speed: one video frame per real second
 LIVE_OUTPUT_WIDTH = 1920    # segments/outputs downscale to 1080p
 LIVE_WINDOW_CHUNKS = 12     # last_hour.mp4 covers this many chunks
+SESSION_REFRESH_EVERY = 12  # rebuild session.mp4 every Nth chunk (~hourly)
 CAPTURE_RETRY_SECONDS = 5
 
 
@@ -101,8 +103,12 @@ def convert_chunk(chunk: Path, segments_dir: Path,
         ffmpeg_bin, "-y", "-loglevel", "error", "-nostats",
         "-fflags", "discardcorrupt",
         "-i", str(chunk),
+        # -r is load-bearing, not redundant with setpts: without it ffmpeg
+        # derives the output rate from the input stream's metadata (12.5
+        # fps on this camera) and DROPS frames to match -- measured 11 of
+        # 47 kept. setpts sets the timestamps; -r sets the output rate.
         "-an", "-vf", vf, "-r", str(fps),
-        "-c:v", "libx264", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
         str(tmp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, **no_console_kwargs())
@@ -110,6 +116,25 @@ def convert_chunk(chunk: Path, segments_dir: Path,
         raise RuntimeError((r.stderr or "").strip()[-300:] or f"ffmpeg exited {r.returncode}")
     os.replace(tmp, out)
     return out
+
+
+def _replace_with_retry(tmp: Path, out_path: Path, attempts: int = 5) -> None:
+    """os.replace, retried briefly.
+
+    On Windows the replace fails with PermissionError while the target is
+    open in another process -- exactly what happens when you're watching
+    last_hour.mp4 in a player as the next chunk lands. The lock clears as
+    soon as the player releases the file, so a few short retries turn a
+    hard failure into a hiccup.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, out_path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(0.4)
 
 
 def refresh_output(segments: List[Path], out_path: Path) -> None:
@@ -134,7 +159,7 @@ def refresh_output(segments: List[Path], out_path: Path) -> None:
         pass
     if r.returncode != 0 or not tmp.exists():
         raise RuntimeError((r.stderr or "").strip()[-300:] or f"ffmpeg exited {r.returncode}")
-    os.replace(tmp, out_path)
+    _replace_with_retry(tmp, out_path)
 
 
 def run_live(camera: Camera, stop_event: threading.Event,
@@ -164,7 +189,13 @@ def run_live(camera: Camera, stop_event: threading.Event,
             f"safe to delete.")
     # Previous sessions' segments are already baked into that session's
     # output files; clear them so segments/ only ever holds this session.
-    for stale in segments_dir.glob("*_tl.mp4"):
+    # Half-written temp files from a crash go too (they match neither the
+    # segment glob nor anything else that cleans up).
+    stale_files = (list(segments_dir.glob("*_tl.mp4"))
+                   + list(segments_dir.glob("*_tl.tmp.mp4"))
+                   + list(root.glob("*.new.mp4"))
+                   + list(root.glob("*.list.txt")))
+    for stale in stale_files:
         try:
             os.remove(stale)
         except OSError:
@@ -177,8 +208,10 @@ def run_live(camera: Camera, stop_event: threading.Event,
         f"Raw chunks are deleted once converted.")
 
     session_segments: List[Path] = []
+    failed_chunks = 0
 
-    def process_chunks(include_newest: bool) -> None:
+    def process_chunks(include_newest: bool, final: bool = False) -> None:
+        nonlocal failed_chunks
         chunks = sorted(chunks_dir.glob("*.ts"))
         if not include_newest and proc.poll() is None:
             # the newest file is still being written to
@@ -190,19 +223,30 @@ def run_live(camera: Camera, stop_event: threading.Event,
             try:
                 seg = convert_chunk(chunk, segments_dir, speedup=speedup)
             except Exception as e:
-                log(f"Live: converting {chunk.name} failed: {e}")
+                failed_chunks += 1
+                log(f"Live: converting {chunk.name} failed ({e}); raw chunk kept for "
+                    f"diagnosis ({failed_chunks} kept so far this session).")
                 continue
             session_segments.append(seg)
+            # Delete as soon as the segment exists: the segment is the
+            # durable artifact and the outputs below are derived from it.
+            # (Deleting after the refresh instead meant a locked output
+            # file -- e.g. one open in a video player -- orphaned the raw
+            # chunk permanently. Seen in the wild: 2.6 GB in one session.)
             try:
-                refresh_output(session_segments[-window_chunks:], last_hour)
-                refresh_output(session_segments, session_file)
-            except Exception as e:
-                log(f"Live: updating outputs failed: {e}")
-                continue
-            try:
-                os.remove(chunk)  # converted and stitched -- raw copy done
+                os.remove(chunk)
             except OSError as e:
                 log(f"Live: couldn't delete converted chunk {chunk.name}: {e}")
+            try:
+                refresh_output(session_segments[-window_chunks:], last_hour)
+                # session.mp4 re-muxes every segment, so refreshing it every
+                # chunk makes total writes grow with the square of session
+                # length (~14 GB/day). Hourly (plus on stop) is plenty for a
+                # file nobody watches live; last_hour.mp4 stays current.
+                if final or len(session_segments) % SESSION_REFRESH_EVERY == 0:
+                    refresh_output(session_segments, session_file)
+            except Exception as e:
+                log(f"Live: updating outputs failed: {e}")
             seg_mb = sum(s.stat().st_size for s in session_segments if s.exists()) / 1e6
             log(f"Live: {chunk.name} done -> window "
                 f"{min(len(session_segments), window_chunks)}/{window_chunks} chunks, "
@@ -222,5 +266,14 @@ def run_live(camera: Camera, stop_event: threading.Event,
         stop_event.wait(2)
 
     stop_capture_process(proc)
-    process_chunks(include_newest=True)  # convert the final partial chunk too
-    log(f"Live timelapse for '{camera.name}' stopped.")
+    # final=True: convert the last partial chunk and bring session.mp4 fully
+    # up to date regardless of where the hourly throttle landed.
+    process_chunks(include_newest=True, final=True)
+    if session_segments:
+        try:
+            refresh_output(session_segments, session_file)
+        except Exception as e:
+            log(f"Live: final session.mp4 update failed: {e}")
+    log(f"Live timelapse for '{camera.name}' stopped."
+        + (f" {failed_chunks} chunk(s) failed to convert and were kept."
+           if failed_chunks else ""))

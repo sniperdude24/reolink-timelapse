@@ -87,6 +87,7 @@ class App:
         self._closed = False
         self._closing = False
         self._window_refresh_tick = 0
+        self._videos_refresh_tick = 0
         self._videos_cache: list = []
 
         self._build_widgets()
@@ -345,6 +346,12 @@ class App:
             status = "Running" if iid in self.running else "Stopped"
             if self.recording_tree.set(iid, "status") != status:
                 self.recording_tree.set(iid, "status", status)
+        self._videos_refresh_tick += 1
+        if self._videos_refresh_tick >= 5:
+            # Videos appear every few minutes at best; scanning every
+            # recording's folder once a second is wasted disk I/O.
+            self._videos_refresh_tick = 0
+            self._refresh_videos_tree()
         self._window_refresh_tick += 1
         if self._window_refresh_tick >= 60:
             self._window_refresh_tick = 0
@@ -352,7 +359,6 @@ class App:
                 recording = self.config.recordings.get(iid)
                 if recording:
                     self.recording_tree.set(iid, "window", self._window_label(recording))
-        self._refresh_videos_tree()
         self._update_live_status()
         self.root.after(1000, self._refresh_status_loop)
 

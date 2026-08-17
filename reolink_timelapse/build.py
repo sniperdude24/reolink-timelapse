@@ -7,6 +7,9 @@ tile edge mis-stitches, persisting until the next keyframe). Flagged
 frames are deleted so they never appear in a video: the line only ever
 shows as one isolated saturated-green column, which nothing in a real
 scene (grass and trees are broad and far less saturated) reproduces.
+Frames that can't be read at all are NOT deleted -- a frame still being
+written by a running capture reads as truncated, and this scan runs on
+manual builds too.
 """
 
 from __future__ import annotations
@@ -15,10 +18,11 @@ import datetime as dt
 import os
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional
 
-from PIL import Image
+from PIL import Image, ImageChops
 
 from .config import Setup
 from .rtsp import check_ffmpeg, no_console_kwargs
@@ -35,25 +39,36 @@ def _frame_date(filename: str) -> Optional[dt.date]:
         return None
 
 
-def has_green_line(path: Path) -> bool:
-    """True when the frame carries the green tile-boundary line artifact
-    (or can't be decoded at all, which would break the build anyway)."""
+def has_green_line(path: Path) -> Optional[bool]:
+    """True when the frame carries the green tile-boundary line artifact,
+    False when it's clean, None when the file can't be read at all.
+
+    None is deliberately NOT "corrupt": a frame that's still being written
+    by a running capture reads as truncated, and deleting it would destroy
+    a perfectly good frame. Unreadable frames are left alone and simply
+    skipped for this build.
+    """
     try:
         im = Image.open(path)
         im.draft("RGB", (384, 216))  # fast JPEG partial decode
         im = im.convert("RGB").resize((192, 108))
     except Exception:
-        return True
+        return None
     w, h = im.size
-    px = im.load()
-    counts = [0] * w
-    for x in range(w):
-        c = 0
-        for y in range(h):
-            r, g, b = px[x, y]
-            if g > 120 and g > 1.6 * r and g > 1.6 * b:
-                c += 1
-        counts[x] = c
+    r, g, b = im.split()
+    # Vivid green: g > 120 and g > 1.6*r and g > 1.6*b, all at C speed.
+    # ImageChops.subtract_modulo would wrap; scale r/b by 1.6 first (point
+    # clamps at 255) so a plain subtract-with-clamp gives the comparison.
+    bright = g.point(lambda v: 255 if v > 120 else 0)
+    r16 = r.point(lambda v: min(255, int(v * 1.6)))
+    b16 = b.point(lambda v: min(255, int(v * 1.6)))
+    over_r = ImageChops.subtract(g, r16).point(lambda v: 255 if v > 0 else 0)
+    over_b = ImageChops.subtract(g, b16).point(lambda v: 255 if v > 0 else 0)
+    mask = ImageChops.multiply(ImageChops.multiply(bright, over_r), over_b)
+    # One BOX-filtered resize to height 1 averages each column, giving the
+    # per-column green density directly (0-255 == 0-100% of the column).
+    col = mask.resize((w, 1), Image.BOX).load()
+    counts = [col[x, 0] * h / 255.0 for x in range(w)]
     need = h * GREEN_LINE_MIN_HEIGHT_FRAC
     for x in range(w):
         if counts[x] >= need:
@@ -65,11 +80,16 @@ def has_green_line(path: Path) -> bool:
 
 
 def prune_corrupt_frames(frame_paths: List[Path]) -> List[Path]:
-    """Delete frames flagged by has_green_line; return the survivors."""
+    """Delete frames carrying the green line; return the frames to build
+    from. Unreadable frames are skipped but never deleted."""
     kept: List[Path] = []
     removed = 0
+    unreadable = 0
     for p in frame_paths:
-        if has_green_line(p):
+        verdict = has_green_line(p)
+        if verdict is None:
+            unreadable += 1  # left on disk on purpose (may be mid-write)
+        elif verdict:
             try:
                 os.remove(p)
             except OSError:
@@ -79,6 +99,8 @@ def prune_corrupt_frames(frame_paths: List[Path]) -> List[Path]:
             kept.append(p)
     if removed:
         print(f"Removed {removed} corrupted frame(s) (green tile-boundary line).")
+    if unreadable:
+        print(f"Skipped {unreadable} unreadable frame(s) (left on disk).")
     return kept
 
 
@@ -136,8 +158,14 @@ def build_timelapse(
     # Concat demuxer + explicit file list instead of "-pattern_type glob":
     # many Windows ffmpeg builds are compiled without POSIX glob() and fail
     # with "Pattern type 'glob' is not available".
-    list_path = os.path.join(frames_dir, "_timelapse_concat_list.txt")
-    with open(list_path, "w", encoding="utf-8") as f:
+    #
+    # The list goes in a unique temp file, not a fixed name inside
+    # frames_dir: two builds over the same frames (a manual build while a
+    # session auto-build runs) would otherwise share one path, and the
+    # first to finish would delete the list the other is still reading.
+    # Entries are absolute, so the list's own location doesn't matter.
+    fd, list_path = tempfile.mkstemp(prefix="timelapse_concat_", suffix=".txt", text=True)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
         for p in frame_paths:
             abs_path = str(p.resolve())
             escaped = abs_path.replace("'", "'\\''")
