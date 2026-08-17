@@ -175,7 +175,9 @@ class Config:
         self.path = path or default_config_path()
         self.cameras: dict[str, Camera] = {}
         self.recordings: dict[str, Recording] = {}
-        self.live_camera: Optional[str] = None  # camera the Live Timelapse panel uses
+        # Cameras the Live Timelapse panel had running; any number can run
+        # at once. Restored on the next launch as the panel's selection.
+        self.live_cameras: list[str] = []
         self.migrated_from: Optional[Path] = None
         self.migration_error: Optional[str] = None
         self.schema_migrated = False
@@ -198,7 +200,13 @@ class Config:
             name: Recording.from_dict(name, data)
             for name, data in (raw.get("recordings") or {}).items()
         }
-        self.live_camera = (raw.get("live") or {}).get("camera_name")
+        live = raw.get("live") or {}
+        # "cameras" is the current shape; "camera_name" is the older
+        # single-camera key, read as a one-element list so existing
+        # configs keep working untouched.
+        self.live_cameras = list(live.get("cameras") or [])
+        if not self.live_cameras and live.get("camera_name"):
+            self.live_cameras = [live["camera_name"]]
         if self.schema_migrated:
             self.save()
 
@@ -250,8 +258,8 @@ class Config:
             "cameras": {name: c.to_dict() for name, c in self.cameras.items()},
             "recordings": {name: r.to_dict() for name, r in self.recordings.items()},
         }
-        if self.live_camera:
-            raw["live"] = {"camera_name": self.live_camera}
+        if self.live_cameras:
+            raw["live"] = {"cameras": list(self.live_cameras)}
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         if sys.platform != "win32":

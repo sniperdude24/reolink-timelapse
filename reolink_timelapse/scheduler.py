@@ -15,17 +15,21 @@ can request a clean stop without waiting out an entire daylight window --
 and so ffmpeg always gets terminated properly rather than orphaned.
 
 Each continuous start-to-stop capture run (one daylight window, or one
-manual start/stop in "always" mode) is a "session": its frames go into
-their own subfolder under frames_dir, named from the session's start time
-plus a short random suffix so two sessions can never collide -- including
-two instances of the same setup started at once. A video is built
-automatically from each session's frames right after it ends.
+manual start/stop in "always" mode) is a "session", with its own subfolder
+named from the session's start time plus a short random suffix so two
+sessions can never collide -- including two instances of the same setup
+started at once.
+
+Capture is video ingest (see chunks.py): ffmpeg stream-copies the feed
+into short .ts chunks, and each completed chunk is rendered into a small
+segment and then deleted, so the render cost is spread across the session
+instead of landing in one lump at the end. The session's video is a cheap
+concat of those segments once the window closes.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import os
 import secrets
 import subprocess
 import threading
@@ -37,8 +41,8 @@ from astral import LocationInfo
 from astral.sun import sun
 from zoneinfo import ZoneInfo
 
-from .build import build_timelapse
-from .capture import read_capture_stderr, start_capture_process, stop_capture_process
+from .capture import read_capture_stderr, stop_capture_process
+from .chunks import CHUNK_SECONDS, ChunkRenderer, refresh_output, start_chunk_capture
 from .config import Setup
 
 RETRY_DELAY_SECONDS = 30
@@ -108,11 +112,19 @@ def _sleep_until(target: dt.datetime, setup: Setup, log, stop_event: threading.E
     return False
 
 
-def _wait_capture(proc, window_end, setup: Setup, stop_event: threading.Event) -> str:
-    """Poll the running capture process in short chunks.
+def _wait_capture(proc, window_end, setup: Setup, stop_event: threading.Event,
+                  renderer: Optional[ChunkRenderer] = None) -> str:
+    """Poll the running capture process in short chunks, rendering each
+    completed chunk as it appears.
 
-    Returns "exited" (ffmpeg died on its own), "window_end" (daylight window
-    is over), or "stopped" (caller requested a stop).
+    Returns "exited" (ffmpeg died on its own), "window_end" (window is
+    over), or "stopped" (caller requested a stop).
+
+    Rendering happens here rather than at session end so the cost is spread
+    across the run -- a 14-hour session rendered in one lump would decode
+    ~14h of 4K at the moment it closes. The trade-off is that a stop or
+    window end can be noticed up to one chunk-conversion late (~45s for a
+    5-minute chunk), the same behaviour the live view has always had.
     """
     while True:
         if stop_event.is_set():
@@ -128,12 +140,17 @@ def _wait_capture(proc, window_end, setup: Setup, stop_event: threading.Event) -
             proc.wait(timeout=chunk)
             return "exited"
         except subprocess.TimeoutExpired:
+            if renderer is not None:
+                renderer.process(proc)
             continue
 
 
-def _new_session_dir(setup: Setup, start: dt.datetime) -> str:
+def _new_session_dir(setup: Setup, start: dt.datetime) -> Path:
+    """Per-session folder holding this run's raw chunks and rendered
+    segments. Chunks are transient -- deleted as soon as each is rendered;
+    the segments are the durable artifact the final video concatenates."""
     session_id = f"{start:%Y%m%d_%H%M%S}_{secrets.token_hex(2)}"
-    return os.path.join(setup.frames_dir, session_id)
+    return Path(setup.output_dir) / "sessions" / session_id
 
 
 def _format_time_label(t: dt.datetime) -> str:
@@ -164,22 +181,28 @@ def _session_capture_setup(setup: Setup, session_start: dt.datetime,
     return replace(setup, interval=interval)
 
 
-def _auto_build_session(
-    setup: Setup, session_dir: str, start: dt.datetime, end: dt.datetime, log
+def _finalize_session(
+    setup: Setup, renderer: ChunkRenderer, start: dt.datetime, end: dt.datetime, log
 ) -> None:
-    if not any(Path(session_dir).glob("*.jpg")):
-        log(f"No frames captured for '{setup.name}' this session -- skipping video build.")
+    """Concat this session's segments into the finished video.
+
+    The frames were already rendered incrementally during the run, so this
+    is a cheap `-c copy` remux rather than a full build.
+    """
+    if not renderer.segments:
+        log(f"No footage captured for '{setup.name}' this session -- skipping video.")
         return
     label = f"{_format_time_label(start)}-{_format_time_label(end)}"
     filename = f"{setup.name}_{start:%Y-%m-%d}_{label}.mp4"
-    output_file = os.path.join(setup.output_dir, filename)
-    log(f"Building video for this session: {filename}")
+    output_file = Path(setup.output_dir) / filename
+    log(f"Finishing video for this session: {filename}")
     try:
-        out = build_timelapse(setup, output_fps=setup.output_fps,
-                              frames_dir=session_dir, output_file=output_file)
-        log(f"Video ready: {out}")
-    except (SystemExit, Exception) as e:
-        log(f"Auto-build failed for '{setup.name}': {e}")
+        refresh_output(renderer.segments, output_file)
+        log(f"Video ready: {output_file}")
+    except Exception as e:
+        log(f"Finalising '{setup.name}' failed: {e}")
+    if renderer.failed:
+        log(f"{renderer.failed} chunk(s) failed to convert and were kept for diagnosis.")
 
 
 _MODE_LABELS = {
@@ -200,7 +223,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
     log("Press Ctrl+C to stop.")
 
     proc = None
-    session_dir = None
+    renderer = None
     session_start = None
     try:
         while not stop_event.is_set():
@@ -216,33 +239,48 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
 
             session_start = _now(setup)
             session_dir = _new_session_dir(setup, session_start)
-            log(f"Capturing for '{setup.name}' into session '{os.path.basename(session_dir)}'"
+            chunks_dir, segments_dir = session_dir / "chunks", session_dir / "segments"
+            log(f"Capturing for '{setup.name}' into session '{session_dir.name}'"
                 + (f" until {window_end.strftime('%H:%M:%S %Z')}" if window_end else "")
                 + "...")
             capture_setup = _session_capture_setup(setup, session_start, window_end, log)
-            proc = start_capture_process(capture_setup, session_dir)
+            # Native resolution (scale_width=None) -- only the live view
+            # downscales. The interval comes from capture_setup, so
+            # length-paced recordings use this session's derived value.
+            renderer = ChunkRenderer(
+                chunks_dir, segments_dir,
+                interval=capture_setup.interval,
+                output_fps=setup.output_fps,
+                log=log,
+            )
+            proc = start_chunk_capture(capture_setup, chunks_dir, CHUNK_SECONDS)
 
             while True:
-                outcome = _wait_capture(proc, window_end, setup, stop_event)
+                outcome = _wait_capture(proc, window_end, setup, stop_event, renderer)
 
                 if outcome == "exited":
                     stderr = read_capture_stderr(proc)
                     log(f"ffmpeg exited unexpectedly (code {proc.returncode}). "
                         f"Retrying in {RETRY_DELAY_SECONDS}s. Last output:\n{stderr[-500:]}")
+                    renderer.process(proc, include_newest=True)
                     if stop_event.wait(RETRY_DELAY_SECONDS):
                         break
                     if window_end is not None and _now(setup) >= window_end:
                         break
-                    proc = start_capture_process(capture_setup, session_dir)  # same session, retrying
+                    # same session, retrying -- the renderer keeps its segments
+                    proc = start_chunk_capture(capture_setup, chunks_dir, CHUNK_SECONDS)
                     continue
                 break  # "window_end" or "stopped"
 
             log(f"Stopping capture for '{setup.name}' for now.")
             stop_capture_process(proc)
             proc = None
+            # The final chunk is still partial; include it now that ffmpeg
+            # has exited and nothing more will be appended to it.
+            renderer.process(None, include_newest=True)
             session_end = _now(setup)
-            _auto_build_session(setup, session_dir, session_start, session_end, log)
-            session_dir = None
+            _finalize_session(setup, renderer, session_start, session_end, log)
+            renderer = None
             session_start = None
 
             if setup.schedule.mode not in ("daylight", "fixed_time") or stop_event.is_set():
@@ -251,7 +289,8 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
         log("\nStopped by user.")
         if proc is not None:
             stop_capture_process(proc)
-        if session_dir is not None:
-            _auto_build_session(setup, session_dir, session_start, _now(setup), log)
+        if renderer is not None:
+            renderer.process(None, include_newest=True)
+            _finalize_session(setup, renderer, session_start, _now(setup), log)
 
     log(f"Scheduler for '{setup.name}' stopped.")

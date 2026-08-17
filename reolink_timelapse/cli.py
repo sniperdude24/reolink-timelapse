@@ -3,10 +3,12 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 import getpass
+from pathlib import Path
 from typing import Optional
 
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .build import build_timelapse
+from .chunks import refresh_output
 from .scheduler import daylight_window, run_scheduled
 
 
@@ -272,9 +274,36 @@ def cmd_live(args: argparse.Namespace) -> None:
         worker.join()
 
 
+def _rebuild_latest_session(setup) -> bool:
+    """Rejoin the newest segment-based session, if there is one.
+
+    Recordings capture video and render clips as they go, so rebuilding one
+    is a lossless concat -- its pacing was fixed at capture time and the
+    fps/date options don't apply. Returns False when there's no such
+    session, leaving the legacy JPEG path to handle it.
+    """
+    root = Path(setup.output_dir) / "sessions"
+    if not root.is_dir():
+        return False
+    for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+        segments = sorted((d / "segments").glob("*_tl.mp4"))
+        if not segments:
+            continue
+        out = Path(setup.output_dir) / f"{setup.name}_{d.name[:15]}_rebuild.mp4"
+        print(f"Rejoining {len(segments)} clip(s) from session {d.name}...")
+        refresh_output(segments, out)
+        print(f"\nDone! Saved to: {out}")
+        return True
+    return False
+
+
 def cmd_build(args: argparse.Namespace) -> None:
     config = _open_config()
     setup = config.resolved(args.name)
+    # Prefer the modern path; fall back to building from legacy JPEG frames.
+    if not any([args.date, args.start_date, args.end_date, args.smooth_fps,
+                args.output_file]) and _rebuild_latest_session(setup):
+        return
     start_date = dt.date.fromisoformat(args.start_date) if args.start_date else None
     end_date = dt.date.fromisoformat(args.end_date) if args.end_date else None
     if args.date:
@@ -324,7 +353,7 @@ def main() -> None:
     p.add_argument("name")
     p.set_defaults(func=cmd_remove_recording)
 
-    p = sub.add_parser("run", help="Start capturing frames for a recording (long-running)")
+    p = sub.add_parser("run", help="Start capturing for a recording (long-running)")
     p.add_argument("name")
     p.set_defaults(func=cmd_run)
 

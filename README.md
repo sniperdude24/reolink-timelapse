@@ -1,9 +1,9 @@
 # reolink-timelapse
 
-Records RTSP frames from an IP camera (Reolink or otherwise) in parallel with
-your NVR's own recording, only during your chosen schedule, and stitches them
-into a timelapse video. Built to drive any number of independent **cameras**
-and **recordings** — different cameras, different locations, different
+Records an RTSP stream from an IP camera (Reolink or otherwise) — or from
+your NVR — only during your chosen schedule, and turns it into a timelapse
+video. Built to drive any number of independent **cameras** and
+**recordings** — different cameras, different locations, different
 schedules, even several recordings off the same camera — from one
 config-driven install rather than a one-off script per camera.
 
@@ -189,55 +189,99 @@ choice.
 
 ## Live rolling timelapse
 
-The **Live Timelapse** panel (bottom-right of the GUI) maintains a
-near-livestream timelapse, independent of scheduled recordings: pick a
-camera and press Start. The camera's stream is saved in 5-minute video
-chunks (a stream copy — near-zero CPU while capturing), and as each chunk
-completes it's folded into two always-current **1080p 60fps** videos at
-60x speed — one video frame per real second, so 5 minutes of real time
-plays in ~5 seconds:
+The **Live Timelapse** panel is the main screen. It lists every camera
+you've added, with Start / Stop, Play Last Hour, Play Session and Open
+Folder acting on whichever camera is selected — plus Add Camera / Edit /
+Remove, so the camera list and the live controls are the same list.
+
+**Any number of cameras can run at once**, each with its own row showing
+live status, chunk count, segment size and last-update time. As each
+camera's chunks complete they're folded into two always-current **1080p
+60fps** videos at 60x speed — one video frame per real second, so 5
+minutes of real time plays in ~5 seconds:
 
 - **`last_hour.mp4`** — the trailing hour, playing in about a minute; the
-  oldest 5 minutes falls off as each new chunk arrives.
-- **`session.mp4`** — everything since you pressed Start, growing as the
-  session runs.
+  oldest 5 minutes falls off as each new chunk arrives. Rebuilt every
+  chunk.
+- **`session.mp4`** — the session in progress, rebuilt every ~15 minutes.
 
-Both live under `Timelapses\Live\<camera>\` and update atomically every
-~5 minutes — the view lags real time by at most one chunk; just re-open
-the file (Play Last Hour / Play Session buttons) to see the latest. From
-the CLI:
+Both live under `Timelapses\Live\<camera>\` and update atomically — the
+view lags real time by at most one chunk; just re-open the file to see the
+latest.
+
+### Sessions roll over every 6 hours
+
+A camera left running for days shouldn't produce one video that grows
+forever. Every 6 hours the session is closed off, renamed into
+`Timelapses\Live\<camera>\sessions\` as
+`<camera>_<date>_<start>-<end>.mp4`, and a fresh one starts — so you get a
+series of watchable ~6-minute timelapses instead of an unopenable monolith.
+Closing a session is a rename, not a re-encode, so it costs nothing. Each
+completed block appears in **Latest Videos**, and stopping the live view
+closes off the partial session the same way.
+
+That cap is also what keeps `session.mp4` current: rebuilding it is a full
+re-mux, so on an uncapped session the cost grows with the square of how
+long it's been running. Bounded to 6 hours, a 15-minute refresh costs about
+8 GB of writes a day.
+
+From the CLI:
 
 ```bash
 python -m reolink_timelapse live --camera backyard
 ```
 
+**Running several cameras.** Capturing is a stream copy and costs almost
+nothing (~1% of one core per camera); the work is in rendering, about
+0.31 cores sustained per 4K camera. Nothing uses the GPU. Rendering does
+arrive in bursts, so conversions across all cameras are **serialised** —
+they queue rather than stacking and spiking the machine. Three 4K cameras
+need roughly 165 seconds of rendering per 5-minute window, so there's
+plenty of headroom.
+
 Disk stays flat no matter how long it runs: each raw chunk is **deleted
 as soon as it's been converted** and stitched into both videos (kept only
 if its conversion fails), the small 1080p segments are kept for the
 current session so its videos could be rebuilt, and starting a new
-session clears the previous session's segments. Chunks left behind by
-older versions aren't touched — the log points them out once as safe to
-delete.
+session clears the previous session's segments. Budget roughly 30 MB per
+hour per camera of kept segments in daylight (much less at night, when
+the dark scene compresses far better), plus one transient chunk of about
+1.8 GB/hour that never accumulates.
 
 ## Sessions, folders, and videos
 
 Every continuous start-to-stop capture run is a **session** — one recurring
 window (Daylight hours / Fixed daily time), one Timer run, or one manual
-start/stop in "Always" mode. Each session gets its own subfolder under
-`frames_dir`, named from its start time plus a short random suffix (e.g.
-`20260816_064712_a1b2`), so two sessions can never collide — including two
-recordings sharing a camera, or two instances of the same recording started
-at the same time.
+start/stop in "Always" mode. Each session gets its own subfolder named from
+its start time plus a short random suffix (e.g. `20260816_064712_a1b2`), so
+two sessions can never collide — including two recordings sharing a camera,
+or two instances of the same recording started at the same time.
 
-A video is **built automatically right after each session ends** — window
-close, timer elapsing, manual stop, or Ctrl+C — named
+### How capture works
+
+Recording ingests **video**, not individual snapshots. One ffmpeg
+stream-copies the camera's feed into short `.ts` chunks — no decoding, so
+capture itself costs almost no CPU. Each completed chunk is immediately
+rendered into a small sped-up clip and **the raw chunk is deleted**, so
+disk stays flat: only the chunk currently recording and the one being
+rendered are ever on disk at once (a chunk is roughly 1.8 GB/hour of 4K
+while it exists).
+
+Rendering as you go matters for long recordings: a 14-hour session rendered
+in one go at the end would take about two hours of decoding. Spreading it
+across the session means the finished video is ready seconds after the
+window closes.
+
+The session's video is then a fast, lossless join of those clips, named
 `<recording>_<date>_<start>-<end>.mp4` (24-hour clock, e.g.
-`backyard_2026-08-16_06h47-20h54.mp4`) and written to `output_dir`, which
-stays a single flat folder shared by every session's video — only the frames
-get split up, not the finished videos. `build <name>` (or the GUI's "Build
-Video...") still works too, and aggregates frames across *all* of a
-recording's sessions (plus any frames captured before per-session folders
-existed) unless you filter by date.
+`backyard_2026-08-16_06h47-20h54.mp4`) and written to the recording's
+folder, which stays flat — only the working files get split per session.
+
+**Rebuilding.** "Build Video..." (or `build <name>`) rejoins a session's
+clips. Because the capture interval and fps were fixed when the session was
+recorded, the fps, smoothing and date fields don't apply to these sessions
+and are greyed out. Sessions captured by older versions are loose JPEG
+frames and still build the old way, with all of those options available.
 
 ## Where things are stored
 
@@ -252,11 +296,15 @@ or a USB drive as a single unit. There's nothing to configure:
   you're upgrading from an older version, the first run automatically
   migrates forward any existing config it finds — nothing already
   configured gets lost.
-- **Frames** save to `<program folder>\Timelapses\<recording-name>\frames\<session>\`,
-  and **finished videos** to `<program folder>\Timelapses\<recording-name>\`
+- **Working files** live in
+  `<program folder>\Timelapses\<recording-name>\sessions\<session>\` —
+  `chunks\` (transient, deleted as each is rendered) and `segments\` (the
+  small rendered clips, kept so the video can be rejoined).
+- **Finished videos** save to `<program folder>\Timelapses\<recording-name>\`
   — always, derived from the recording's name. (Older versions let these
   be customized per recording; any previously customized folders are left
-  in place on disk but are no longer read or written.)
+  in place on disk but are no longer read or written. Old `frames\`
+  folders are also left alone and remain buildable.)
 
 Note for source runs: `config.yaml` (which holds plaintext camera
 credentials) ends up sitting directly in the repo working directory. It's
@@ -269,17 +317,28 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   normal file ACLs). Fine for personal/local use. OS keychain storage via
   `keyring` is a reasonable future improvement if this needs to be more
   robust.
-- Frames are named by timestamp (`%Y%m%d_%H%M%S.jpg`), so they sort
-  chronologically for free and `build --date` can filter by day.
-- Three protections keep corrupted frames out of your timelapses. Frames
-  ffmpeg flags as corrupt are dropped instead of saved (`-fflags
-  discardcorrupt`); capture intervals of 5 seconds or more save only
-  **keyframes** — the self-contained frames the camera sends every couple
-  of seconds that can't inherit smearing from earlier damage; and every
-  build first scans its frames for the **green tile-boundary line** some
-  Reolink HEVC streams produce (a thin vivid-green vertical stripe at a
-  fixed position) and deletes any frame carrying it. None of these
-  shorten your videos meaningfully: a slot just gets the next clean
-  frame. (Recording the stream to a video file instead of frames was
-  considered for this and doesn't help — the same damaged bits meet the
-  same decoder at build time.)
+- Chunks and clips are named by timestamp, so they sort chronologically
+  for free.
+- **If you see corruption, check the source first.** Streaming the same
+  camera twice at once (say, an NVR recording it *and* this app pulling
+  it directly) can push the camera past what it can reliably send, and it
+  drops slices to keep up. The damage is baked into the stream before this
+  app ever sees it, so no amount of processing here can undo it. If the
+  camera is attached to an NVR, point the recording at the **NVR's**
+  channel instead — Reolink NVRs re-serve each channel over RTSP with the
+  same URL shape (`h264Preview_<channel>_main`), usually as a
+  pass-through, so you get identical quality with one less consumer on the
+  camera. Measured on the author's setup: the direct feed produced regular
+  bursts of damage, the same camera via the NVR produced none.
+- Two protections handle what does slip through. Packets ffmpeg flags as
+  corrupt are dropped (`-fflags discardcorrupt`), and capture intervals of
+  5 seconds or more keep only **keyframes** — the self-contained frames
+  the camera sends every couple of seconds, which can't inherit smearing
+  from earlier damage. Neither shortens your video meaningfully; a slot
+  just gets the next clean frame.
+- Decoding is deliberately software-only. GPU decode (NVDEC) was tried and
+  rejected: on Reolink's tiled HEVC it mis-stitches tile boundaries into a
+  vivid-green vertical line — decoding the same recording twice gave 0
+  damaged frames in software versus 401 with NVDEC. GPU *encoding* (NVENC)
+  was also measured and rejected: it saves about 5% CPU while making files
+  4x larger.

@@ -17,6 +17,7 @@ from zoneinfo import available_timezones
 import tzlocal
 
 from .build import build_timelapse
+from .chunks import refresh_output
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .live import live_dirs, run_live
 from .scheduler import daylight_window, next_window, run_scheduled
@@ -81,8 +82,11 @@ class App:
 
         self.config = Config()
         self.running: dict[str, RunningCapture] = {}
-        self.live_worker: Optional[RunningCapture] = None
-        self.live_state: dict = {}
+        # Any number of cameras can run live at once; both dicts are keyed
+        # by camera name. Worker threads only ever write live_state[name],
+        # the UI loop only reads, so no locking is needed.
+        self.live_workers: dict[str, RunningCapture] = {}
+        self.live_state: dict[str, dict] = {}
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._closed = False
         self._closing = False
@@ -114,6 +118,7 @@ class App:
 
         videos_frame = ttk.LabelFrame(right, text="Latest Videos")
         videos_frame.pack(fill="both", expand=True)
+        self._videos_frame = videos_frame
         self.videos_tree = ttk.Treeview(
             videos_frame, columns=("recording", "created"), show="tree headings", height=15
         )
@@ -130,55 +135,49 @@ class App:
         ttk.Button(videos_toolbar, text="Play", command=self.on_play_video).pack(side="left", padx=2)
         ttk.Button(videos_toolbar, text="Show in Folder", command=self.on_show_video_folder).pack(side="left", padx=2)
 
-        live_frame = ttk.LabelFrame(right, text="Live Timelapse")
-        live_frame.pack(fill="x", pady=(8, 0))
-        live_top = ttk.Frame(live_frame)
-        live_top.pack(fill="x", padx=4, pady=(4, 2))
-        ttk.Label(live_top, text="Camera:").pack(side="left")
-        self.live_camera_var = tk.StringVar(value=self.config.live_camera or "")
-        self.live_camera_combo = ttk.Combobox(
-            live_top, textvariable=self.live_camera_var, state="readonly",
-            values=sorted(self.config.cameras), width=16,
-        )
-        self.live_camera_combo.pack(side="left", padx=4)
-        live_buttons = ttk.Frame(live_frame)
-        live_buttons.pack(fill="x", padx=4, pady=2)
-        ttk.Button(live_buttons, text="Start", command=self.on_live_start).pack(side="left", padx=2)
-        ttk.Button(live_buttons, text="Stop", command=self.on_live_stop).pack(side="left", padx=2)
-        live_play = ttk.Frame(live_frame)
-        live_play.pack(fill="x", padx=4, pady=2)
-        ttk.Button(live_play, text="Play Last Hour",
+        # Live Timelapse is the main feature: it gets the top of the left
+        # column and the camera list itself, so there's no separate
+        # "Added Cameras" section to keep in sync.
+        live_frame = ttk.LabelFrame(left, text="Live Timelapse")
+        live_frame.pack(fill="both", expand=True, padx=8, pady=(8, 4))
+
+        live_run = ttk.Frame(live_frame)
+        live_run.pack(fill="x", padx=4, pady=(4, 0))
+        ttk.Button(live_run, text="Start", command=self.on_live_start).pack(side="left", padx=2)
+        ttk.Button(live_run, text="Stop", command=self.on_live_stop).pack(side="left", padx=2)
+        ttk.Separator(live_run, orient="vertical").pack(side="left", fill="y", padx=6)
+        ttk.Button(live_run, text="Play Last Hour",
                    command=lambda: self.on_play_live("last_hour.mp4")).pack(side="left", padx=2)
-        ttk.Button(live_play, text="Play Session",
+        ttk.Button(live_run, text="Play Session",
                    command=lambda: self.on_play_live("session.mp4")).pack(side="left", padx=2)
-        self.live_status_var = tk.StringVar(value="Off")
-        ttk.Label(live_frame, textvariable=self.live_status_var, foreground="gray").pack(
-            anchor="w", padx=6, pady=(2, 4))
+        ttk.Button(live_run, text="Open Folder",
+                   command=self.on_open_live_folder).pack(side="left", padx=2)
 
-        cameras_frame = ttk.LabelFrame(left, text="Added Cameras")
-        cameras_frame.pack(fill="x", padx=8, pady=(8, 4))
-
-        cameras_toolbar = ttk.Frame(cameras_frame)
-        cameras_toolbar.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Button(cameras_toolbar, text="Add Camera", command=self.on_add_camera).pack(side="left", padx=2)
-        ttk.Button(cameras_toolbar, text="Remove", command=self.on_remove_camera).pack(side="left", padx=2)
-
-        cameras_toolbar2 = ttk.Frame(cameras_frame)
-        cameras_toolbar2.pack(fill="x", padx=4, pady=(2, 4))
-        ttk.Button(cameras_toolbar2, text="Edit", command=self.on_edit_camera).pack(side="left", padx=2)
+        live_manage = ttk.Frame(live_frame)
+        live_manage.pack(fill="x", padx=4, pady=(2, 4))
+        ttk.Button(live_manage, text="Add Camera", command=self.on_add_camera).pack(side="left", padx=2)
+        ttk.Button(live_manage, text="Edit", command=self.on_edit_camera).pack(side="left", padx=2)
+        ttk.Button(live_manage, text="Remove", command=self.on_remove_camera).pack(side="left", padx=2)
 
         self.camera_tree = ttk.Treeview(
-            cameras_frame, columns=("camera", "channel", "stream"), show="tree headings", height=5
+            live_frame, columns=("address", "status", "chunks", "segments", "updated"),
+            show="tree headings", height=8,
         )
         self.camera_tree.heading("#0", text="Camera")
-        self.camera_tree.heading("camera", text="Address")
-        self.camera_tree.heading("channel", text="Channel")
-        self.camera_tree.heading("stream", text="Stream")
-        self.camera_tree.column("#0", width=130)
-        self.camera_tree.column("camera", width=170)
-        self.camera_tree.column("channel", width=80)
-        self.camera_tree.column("stream", width=90)
-        self.camera_tree.pack(fill="x", padx=4, pady=(0, 4))
+        self.camera_tree.heading("address", text="Address")
+        self.camera_tree.heading("status", text="Status")
+        self.camera_tree.heading("chunks", text="Chunks")
+        self.camera_tree.heading("segments", text="Segments")
+        self.camera_tree.heading("updated", text="Updated")
+        self.camera_tree.column("#0", width=140)
+        self.camera_tree.column("address", width=180)
+        self.camera_tree.column("status", width=80, anchor="center")
+        self.camera_tree.column("chunks", width=70, anchor="e")
+        self.camera_tree.column("segments", width=90, anchor="e")
+        self.camera_tree.column("updated", width=90, anchor="center")
+        self.camera_tree.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.camera_tree.bind("<Double-1>",
+                              lambda _e: self.on_play_live("last_hour.mp4"))
 
         recordings_frame = ttk.LabelFrame(left, text="Scheduled Recordings")
         recordings_frame.pack(fill="x", padx=8, pady=(4, 4))
@@ -226,12 +225,16 @@ class App:
         self._refresh_camera_tree()
         self._refresh_recording_tree()
         self._refresh_videos_tree()
-        self.live_camera_combo.configure(values=sorted(self.config.cameras))
 
     def _scan_latest_videos(self) -> list:
-        """[(mtime, path, recording_name)] for the newest ~20 built videos
-        across every recording's output folder, oldest first so the newest
-        video sits at the bottom of the list."""
+        """[(mtime, path, source_name)] for the newest ~20 finished videos,
+        oldest first so the newest sits at the bottom of the list.
+
+        Covers both sources: each recording's output folder, and the dated
+        blocks a live session closes off into Timelapses/Live/<camera>/
+        sessions/ -- without the latter, completed live timelapses would
+        appear nowhere in the UI.
+        """
         entries = []
         for name, r in self.config.recordings.items():
             out = Path(r.output_dir)
@@ -240,6 +243,15 @@ class App:
             for p in out.glob("*.mp4"):
                 try:
                     entries.append((p.stat().st_mtime, str(p), name))
+                except OSError:
+                    continue
+        for name in self.config.cameras:
+            blocks = live_dirs(name)[2] / "sessions"
+            if not blocks.is_dir():
+                continue
+            for p in blocks.glob("*.mp4"):
+                try:
+                    entries.append((p.stat().st_mtime, str(p), f"{name} (live)"))
                 except OSError:
                     continue
         entries.sort(reverse=True)
@@ -283,14 +295,24 @@ class App:
             return
         os.startfile(os.path.dirname(path))
 
+    def _live_cells(self, name: str) -> tuple:
+        """(status, chunks, segments, updated) for one camera's live row."""
+        if not self._live_running(name):
+            return ("Off", "", "", "")
+        st = self.live_state.get(name) or {}
+        if not st.get("updated"):
+            return ("Live", "...", "", "")
+        return ("Live", str(st["chunks"]), f"{st['mb']:.0f} MB",
+                st["updated"].strftime("%H:%M:%S"))
+
     def _refresh_camera_tree(self) -> None:
         selected = self._tree_selection(self.camera_tree)
         self.camera_tree.delete(*self.camera_tree.get_children())
         for name, c in sorted(self.config.cameras.items()):
+            stream = "sub" if c.substream else "main"
             self.camera_tree.insert("", "end", iid=name, text=name, values=(
-                f"{c.ip}:{c.port}",
-                c.channel,
-                "sub" if c.substream else "main",
+                f"{c.ip}:{c.port} ch{c.channel:02d} {stream}",
+                *self._live_cells(name),
             ))
         if selected and self.camera_tree.exists(selected):
             self.camera_tree.selection_set(selected)
@@ -342,6 +364,9 @@ class App:
         for name in list(self.running):
             if not self.running[name].thread.is_alive():
                 del self.running[name]
+        for name in list(self.live_workers):
+            if not self.live_workers[name].thread.is_alive():
+                del self.live_workers[name]
         for iid in self.recording_tree.get_children():
             status = "Running" if iid in self.running else "Stopped"
             if self.recording_tree.set(iid, "status") != status:
@@ -411,6 +436,12 @@ class App:
         if not name:
             messagebox.showinfo("Remove Camera", "Select a camera first.")
             return
+        if self._live_running(name):
+            messagebox.showwarning(
+                "Remove Camera",
+                f"'{name}' is running live. Stop it before removing the camera.",
+            )
+            return
         using = [r.name for r in self.config.recordings.values() if r.camera_name == name]
         if any(r in self.running for r in using):
             messagebox.showwarning(
@@ -425,6 +456,8 @@ class App:
         except SystemExit as e:
             messagebox.showerror("Remove Camera", str(e))
             return
+        if name in self.config.live_cameras:
+            self.config.live_cameras.remove(name)
         self.config.save()
         self.refresh_lists()
 
@@ -521,74 +554,102 @@ class App:
 
     # ---- live timelapse ----
 
-    def _live_running(self) -> bool:
-        return self.live_worker is not None and self.live_worker.thread.is_alive()
+    def _live_running(self, name: str) -> bool:
+        rc = self.live_workers.get(name)
+        return rc is not None and rc.thread.is_alive()
+
+    def _selected_live_camera(self, action: str) -> Optional[str]:
+        name = self._tree_selection(self.camera_tree)
+        if not name or name not in self.config.cameras:
+            messagebox.showinfo("Live Timelapse", f"Select a camera to {action}.")
+            return None
+        return name
 
     def on_live_start(self) -> None:
-        if self._live_running():
+        name = self._selected_live_camera("start")
+        if name is None:
             return
-        name = self.live_camera_var.get()
-        if not name or name not in self.config.cameras:
-            messagebox.showinfo("Live Timelapse", "Select a camera first.")
+        if self._live_running(name):
+            messagebox.showinfo("Live Timelapse", f"'{name}' is already running.")
             return
         camera = self.config.cameras[name]
-        self.config.live_camera = name
-        self.config.save()
+        if name not in self.config.live_cameras:
+            self.config.live_cameras.append(name)
+            self.config.save()
 
         def status_cb(chunks: int, seg_mb: float) -> None:
-            # worker thread -> whole-dict swap; the status loop only reads
-            self.live_state = {"chunks": chunks, "mb": seg_mb, "updated": dt.datetime.now()}
+            # Worker thread -> whole-dict swap per camera; the status loop
+            # only ever reads, so no lock is needed.
+            self.live_state[name] = {
+                "chunks": chunks, "mb": seg_mb, "updated": dt.datetime.now(),
+            }
 
         stop_event = threading.Event()
         thread = threading.Thread(
-            target=self._live_worker_fn, args=(camera, stop_event, status_cb), daemon=True
+            target=self._live_worker_fn, args=(name, camera, stop_event, status_cb),
+            daemon=True,
         )
-        self.live_worker = RunningCapture(thread, stop_event)
-        self.live_state = {}
+        self.live_workers[name] = RunningCapture(thread, stop_event)
+        self.live_state.pop(name, None)
         thread.start()
         self._update_live_status()
 
-    def _live_worker_fn(self, camera, stop_event, status_cb) -> None:
+    def _live_worker_fn(self, name, camera, stop_event, status_cb) -> None:
         try:
             run_live(camera, stop_event, log=self.log, status=status_cb)
         except SystemExit as e:
-            self.log(f"Live timelapse stopped: {e}")
+            self.log(f"Live timelapse for '{name}' stopped: {e}")
         except Exception as e:
-            self.log(f"Live timelapse crashed: {e}")
+            self.log(f"Live timelapse for '{name}' crashed: {e}")
 
     def on_live_stop(self) -> None:
-        if not self._live_running():
-            messagebox.showinfo("Live Timelapse", "The live timelapse isn't running.")
+        name = self._selected_live_camera("stop")
+        if name is None:
             return
-        self.log("Stopping live timelapse (finishing the current chunk)...")
-        self.live_worker.stop_event.set()
+        if not self._live_running(name):
+            messagebox.showinfo("Live Timelapse", f"'{name}' isn't running.")
+            return
+        self.log(f"Stopping live timelapse for '{name}' (finishing the current chunk)...")
+        self.live_workers[name].stop_event.set()
+        if name in self.config.live_cameras:
+            self.config.live_cameras.remove(name)
+            self.config.save()
 
     def on_play_live(self, filename: str) -> None:
-        name = self.live_camera_var.get()
-        if not name:
-            messagebox.showinfo("Live Timelapse", "Select a camera first.")
+        name = self._selected_live_camera("play")
+        if name is None:
             return
         path = live_dirs(name)[2] / filename
         if not path.exists():
             messagebox.showinfo(
                 "Live Timelapse",
-                "No live video yet -- start the live timelapse and wait for the first chunk.",
+                f"No live video for '{name}' yet -- start it and wait for the first chunk.",
             )
             return
         os.startfile(str(path))  # Windows only, same convention as Latest Videos
 
+    def on_open_live_folder(self) -> None:
+        name = self._selected_live_camera("open")
+        if name is None:
+            return
+        root = live_dirs(name)[2]
+        if not root.is_dir():
+            messagebox.showinfo(
+                "Live Timelapse",
+                f"'{name}' has no live folder yet -- start it once to create one.",
+            )
+            return
+        os.startfile(str(root))
+
     def _update_live_status(self) -> None:
-        if self._live_running():
-            st = self.live_state
-            if st.get("updated"):
-                text = (f"Live -- updated {st['updated']:%H:%M:%S}, "
-                        f"{st['chunks']} chunks, {st['mb']:.0f} MB of segments")
-            else:
-                text = "Live -- waiting for the first chunk..."
-        else:
-            text = "Off"
-        if self.live_status_var.get() != text:
-            self.live_status_var.set(text)
+        """Refresh each camera's live cells in place, only where changed."""
+        for iid in self.camera_tree.get_children():
+            cells = self._live_cells(iid)
+            for column, value in zip(
+                ("status", "chunks", "segments", "updated"), cells
+            ):
+                if self.camera_tree.set(iid, column) != value:
+                    self.camera_tree.set(iid, column, value)
 
     # ---- shutdown ----
 
@@ -596,8 +657,8 @@ class App:
         if self._closing:
             return
         workers = list(self.running.values())
-        if self._live_running():
-            workers.append(self.live_worker)
+        workers += [rc for name, rc in self.live_workers.items()
+                    if rc.thread.is_alive()]
         if workers:
             if not messagebox.askyesno(
                 "Quit", f"{len(workers)} capture(s) still running. Stop them and quit?"
@@ -1262,19 +1323,21 @@ class BuildDialog(tk.Toplevel):
             self, textvariable=self.scope_var, state="readonly",
             values=scope_values, width=34,
         )
-        add_row("Frames to use", self.scope_combo)
-        self.scope_combo.bind("<<ComboboxSelected>>", self._update_build_estimate)
+        add_row("Session to build", self.scope_combo)
+        self.scope_combo.bind("<<ComboboxSelected>>", lambda _e: self._toggle_smooth())
 
         self.fps_var = tk.StringVar(value=f"{setup.output_fps:g}")
-        add_row("Output fps", ttk.Entry(self, textvariable=self.fps_var))
+        self.fps_entry = ttk.Entry(self, textvariable=self.fps_var)
+        add_row("Output fps", self.fps_entry)
 
         self.smooth_var = tk.BooleanVar(value=False)
         self.base_fps_var = tk.StringVar(value="5")
         smooth_frame = ttk.Frame(self)
-        ttk.Checkbutton(
+        self.smooth_check = ttk.Checkbutton(
             smooth_frame, text="Smooth motion (interpolate in-between frames)",
             variable=self.smooth_var, command=self._toggle_smooth,
-        ).pack(anchor="w")
+        )
+        self.smooth_check.pack(anchor="w")
         base_row = ttk.Frame(smooth_frame)
         base_row.pack(anchor="w")
         ttk.Label(base_row, text="Real frames per second:").pack(side="left")
@@ -1288,16 +1351,18 @@ class BuildDialog(tk.Toplevel):
         row += 1
         self.fps_var.trace_add("write", self._update_build_estimate)
         self.base_fps_var.trace_add("write", self._update_build_estimate)
-        self._toggle_smooth()
 
         self.date_var = tk.StringVar(value="")
-        add_row("Single date (YYYY-MM-DD, optional)", ttk.Entry(self, textvariable=self.date_var))
+        self.date_entry = ttk.Entry(self, textvariable=self.date_var)
+        add_row("Single date (YYYY-MM-DD, optional)", self.date_entry)
 
         self.start_date_var = tk.StringVar(value="")
-        add_row("Start date (optional)", ttk.Entry(self, textvariable=self.start_date_var))
+        self.start_date_entry = ttk.Entry(self, textvariable=self.start_date_var)
+        add_row("Start date (optional)", self.start_date_entry)
 
         self.end_date_var = tk.StringVar(value="")
-        add_row("End date (optional)", ttk.Entry(self, textvariable=self.end_date_var))
+        self.end_date_entry = ttk.Entry(self, textvariable=self.end_date_var)
+        add_row("End date (optional)", self.end_date_entry)
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var).grid(row=row, column=0, columnspan=2, **pad)
@@ -1309,41 +1374,88 @@ class BuildDialog(tk.Toplevel):
         self.build_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side="left", padx=4)
 
-        self._update_build_estimate()
+        # After every widget exists -- this gates field states by scope.
+        self._toggle_smooth()
 
     def _list_sessions(self) -> list:
-        """[(label, session_dir_path)] for session subfolders that contain
-        frames, newest first. Labels carry a readable start time and frame
-        count so the right session is easy to spot. Also records per-scope
-        frame counts for the estimated-length label."""
+        """[(label, path)] for buildable sessions, newest first.
+
+        Two kinds coexist. Recordings made by the current version capture
+        video and render segments as they go, so rebuilding is a lossless
+        concat -- their pacing is already baked in. Sessions captured by
+        older versions are loose JPEGs and still go through
+        build_timelapse, which can re-time and smooth them. `_scope_kind`
+        records which is which so the dialog can enable the right fields.
+        """
         sessions = []
         self._scope_counts: dict = {}
+        self._scope_kind: dict = {}
+
+        # Newer, segment-based sessions first (they're the recent ones).
+        seg_root = Path(self.setup.output_dir) / "sessions"
+        if seg_root.is_dir():
+            for d in sorted((p for p in seg_root.iterdir() if p.is_dir()), reverse=True):
+                segs = sorted((d / "segments").glob("*_tl.mp4"))
+                if not segs:
+                    continue
+                try:
+                    started = dt.datetime.strptime(d.name[:15], "%Y%m%d_%H%M%S")
+                    when = f"{started:%Y-%m-%d %H:%M}"
+                except ValueError:
+                    when = d.name
+                label = f"Session {when} ({len(segs)} clips)"
+                sessions.append((label, str(d)))
+                self._scope_counts[label] = len(segs)
+                self._scope_kind[label] = "segments"
+
         root = Path(self.setup.frames_dir)
-        if not root.is_dir():
-            self._scope_counts[ALL_SESSIONS] = 0
-            return sessions
-        total = sum(1 for _ in root.glob("*.jpg"))  # legacy loose frames
-        for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
-            count = sum(1 for _ in d.glob("*.jpg"))
-            if not count:
-                continue
-            try:
-                started = dt.datetime.strptime(d.name[:15], "%Y%m%d_%H%M%S")
-                label = f"Session {started:%Y-%m-%d %H:%M} ({count} frames)"
-            except ValueError:
-                label = f"Session {d.name} ({count} frames)"
-            sessions.append((label, str(d)))
-            self._scope_counts[label] = count
-            total += count
+        total = 0
+        if root.is_dir():
+            total = sum(1 for _ in root.glob("*.jpg"))  # legacy loose frames
+            for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
+                count = sum(1 for _ in d.glob("*.jpg"))
+                if not count:
+                    continue
+                try:
+                    started = dt.datetime.strptime(d.name[:15], "%Y%m%d_%H%M%S")
+                    label = f"Session {started:%Y-%m-%d %H:%M} ({count} frames)"
+                except ValueError:
+                    label = f"Session {d.name} ({count} frames)"
+                sessions.append((label, str(d)))
+                self._scope_counts[label] = count
+                self._scope_kind[label] = "frames"
+                total += count
         self._scope_counts[ALL_SESSIONS] = total
+        self._scope_kind[ALL_SESSIONS] = "frames"
         return sessions
 
+    def _scope_is_segments(self) -> bool:
+        return self._scope_kind.get(self.scope_var.get()) == "segments"
+
     def _toggle_smooth(self) -> None:
-        self.base_fps_entry.configure(state="normal" if self.smooth_var.get() else "disabled")
+        """Enable only the fields that mean something for the current scope.
+
+        For a segment-based session the capture interval and fps were fixed
+        when it was recorded, and rebuilding just re-joins the rendered
+        clips -- so offering fps, smoothing or date filters there would be
+        a lie. Legacy JPEG sessions keep the full set.
+        """
+        segments = self._scope_is_segments()
+        for widget in (self.fps_entry, self.smooth_check,
+                       self.date_entry, self.start_date_entry, self.end_date_entry):
+            widget.configure(state="disabled" if segments else "normal")
+        smooth_on = self.smooth_var.get() and not segments
+        self.base_fps_entry.configure(state="normal" if smooth_on else "disabled")
         self._update_build_estimate()
 
     def _update_build_estimate(self, *_args) -> None:
         frames = self._scope_counts.get(self.scope_var.get(), 0)
+        if self._scope_is_segments():
+            self.est_var.set(
+                f"Joins {frames} recorded clip(s) as-is -- speed and fps were "
+                f"set when this session was captured."
+            )
+            return
         try:
             fps = float(self.fps_var.get())
             if fps <= 0:
@@ -1368,6 +1480,18 @@ class BuildDialog(tk.Toplevel):
         return dt.date.fromisoformat(s) if s else None
 
     def _start_build(self) -> None:
+        scope = self.scope_var.get()
+        if self._scope_is_segments():
+            session_dir = next((p for label, p in self.sessions if label == scope), None)
+            self.build_btn.configure(state="disabled")
+            self.status_var.set("Joining clips...")
+            self.log(f"Rebuilding video for '{self.setup.name}' ({scope})...")
+            self._result_queue = queue.Queue()
+            threading.Thread(target=self._segment_worker,
+                             args=(session_dir,), daemon=True).start()
+            self.after(100, self._poll_result)
+            return
+
         try:
             fps = float(self.fps_var.get())
             single_date = self._parse_date(self.date_var.get())
@@ -1388,7 +1512,6 @@ class BuildDialog(tk.Toplevel):
                 )
                 return
 
-        scope = self.scope_var.get()
         frames_dir = next((path for label, path in self.sessions if label == scope), None)
 
         self.build_btn.configure(state="disabled")
@@ -1416,6 +1539,23 @@ class BuildDialog(tk.Toplevel):
                 frames_dir=frames_dir, smooth_base_fps=smooth_base_fps,
             )
             self._result_queue.put((out, None))
+        except (SystemExit, Exception) as e:
+            self._result_queue.put((None, str(e)))
+
+    def _segment_worker(self, session_dir: Optional[str]) -> None:
+        """Rebuild a segment-based session: a lossless concat of its clips.
+
+        Same background-thread rule as _worker -- hand results back through
+        the queue, never touch Tk from here.
+        """
+        try:
+            segments = sorted(Path(session_dir).joinpath("segments").glob("*_tl.mp4"))
+            if not segments:
+                raise RuntimeError("this session has no rendered clips left on disk.")
+            stamp = Path(session_dir).name[:15]
+            out = Path(self.setup.output_dir) / f"{self.setup.name}_{stamp}_rebuild.mp4"
+            refresh_output(segments, out)
+            self._result_queue.put((str(out), None))
         except (SystemExit, Exception) as e:
             self._result_queue.put((None, str(e)))
 
