@@ -193,8 +193,9 @@ The **Live Timelapse** panel (bottom-right of the GUI) maintains a
 near-livestream timelapse, independent of scheduled recordings: pick a
 camera and press Start. The camera's stream is saved in 5-minute video
 chunks (a stream copy — near-zero CPU while capturing), and as each chunk
-completes it's folded into two always-current videos, at 60x speed
-(5 minutes of real time plays in ~5 seconds):
+completes it's folded into two always-current **1080p 60fps** videos at
+60x speed — one video frame per real second, so 5 minutes of real time
+plays in ~5 seconds:
 
 - **`last_hour.mp4`** — the trailing hour, playing in about a minute; the
   oldest 5 minutes falls off as each new chunk arrives.
@@ -210,10 +211,13 @@ the CLI:
 python -m reolink_timelapse live --camera backyard
 ```
 
-The raw full-speed chunks are **kept** in `Timelapses\Live\<camera>\chunks\`
-as a full video archive — on a 4K main stream that's roughly **4 GB per
-hour** (~90 GB per day), so keep an eye on disk if you leave it running
-long-term (the log line reports the accumulated size after every chunk).
+Disk stays flat no matter how long it runs: each raw chunk is **deleted
+as soon as it's been converted** and stitched into both videos (kept only
+if its conversion fails), the small 1080p segments are kept for the
+current session so its videos could be rebuilt, and starting a new
+session clears the previous session's segments. Chunks left behind by
+older versions aren't touched — the log points them out once as safe to
+delete.
 
 ## Sessions, folders, and videos
 

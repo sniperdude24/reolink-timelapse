@@ -3,19 +3,26 @@
 One continuous ffmpeg stream-copies the camera's RTSP feed into gapless
 5-minute .ts chunk files (no decode, no encode -- near-zero CPU while
 capturing). As each chunk completes, it is converted into a small sped-up
-segment (60x by default: 5 minutes -> ~5 seconds), decoded in software --
-NVDEC mis-stitches this camera family's tiled HEVC into green lines, see
-capture.py. Two always-current outputs are then refreshed by concat-
-remuxing segments (-c copy, cheap):
+1080p60 segment (60x: 5 minutes -> ~5 seconds, one video frame per real
+second), decoded in software -- NVDEC mis-stitches this camera family's
+tiled HEVC into green lines, see capture.py. Two always-current outputs
+are then refreshed by concat-remuxing segments (-c copy, cheap):
 
 - last_hour.mp4: the trailing window (newest 12 chunks), oldest falls off
 - session.mp4: everything since this live session started
 
 Both are written to a temp file and os.replace()d, so opening one never
 catches a half-written video. The view lags real time by at most one
-chunk. Raw chunks are deliberately kept (user's choice: a full-speed video
-archive, ~4 GB/hour on a 4K main stream) -- the running log line reports
-the accumulated size.
+chunk.
+
+Disk stays flat by design (user's choice, revised from an earlier
+keep-everything policy): each raw chunk is deleted as soon as its segment
+is built and both outputs are refreshed (kept only when conversion fails,
+for diagnosis), segments are kept for the whole session so its outputs
+could be rebuilt, and a new session clears the previous session's
+segments (already baked into that session's output files). Chunks left
+behind by pre-retention versions are never touched -- they're excluded
+from the new session and reported once as safe to delete.
 
 Chunks use the mpegts container so a crash mid-write still leaves a
 playable file, and are named by wall-clock start time so they sort
@@ -42,7 +49,8 @@ from .rtsp import build_rtsp_url, check_ffmpeg, no_console_kwargs
 
 LIVE_CHUNK_SECONDS = 300
 LIVE_SPEEDUP = 60           # 5 min of real time -> ~5s of video
-LIVE_OUTPUT_FPS = 30
+LIVE_OUTPUT_FPS = 60        # with 60x speed: one video frame per real second
+LIVE_OUTPUT_WIDTH = 1920    # segments/outputs downscale to 1080p
 LIVE_WINDOW_CHUNKS = 12     # last_hour.mp4 covers this many chunks
 CAPTURE_RETRY_SECONDS = 5
 
@@ -88,7 +96,7 @@ def convert_chunk(chunk: Path, segments_dir: Path,
     tmp = Path(segments_dir) / f"{chunk.stem}_tl.tmp.mp4"
     interval = speedup / fps  # real seconds per output frame
     vf = (f"select=isnan(prev_selected_t)+gte(t-prev_selected_t\\,{interval}),"
-          f"setpts=N/({fps}*TB)")
+          f"scale={LIVE_OUTPUT_WIDTH}:-2,setpts=N/({fps}*TB)")
     cmd = [
         ffmpeg_bin, "-y", "-loglevel", "error", "-nostats",
         "-fflags", "discardcorrupt",
@@ -136,19 +144,39 @@ def run_live(camera: Camera, stop_event: threading.Event,
              speedup: float = LIVE_SPEEDUP,
              window_chunks: int = LIVE_WINDOW_CHUNKS) -> None:
     """Capture + convert loop; runs until stop_event is set. `status` (if
-    given) receives (session_chunk_count, raw_gb) after each chunk."""
+    given) receives (session_chunk_count, segment_mb) after each chunk."""
     chunks_dir, segments_dir, root = live_dirs(camera.name)
+    os.makedirs(chunks_dir, exist_ok=True)
     os.makedirs(segments_dir, exist_ok=True)
     last_hour = root / "last_hour.mp4"
     session_file = root / "session.mp4"
 
+    # Session = since Start. Chunks already in the folder (kept by older
+    # versions, or left by a failed conversion) must not be folded into
+    # this session -- they'd sort first and prepend old footage. Exclude
+    # them, and report them once; they're the user's to delete.
+    leftover_chunks = sorted(chunks_dir.glob("*.ts"))
+    processed: set = {c.name for c in leftover_chunks}
+    if leftover_chunks:
+        leftover_gb = sum(c.stat().st_size for c in leftover_chunks) / 1e9
+        log(f"Live: {len(leftover_chunks)} raw chunk(s) from earlier runs in "
+            f"{chunks_dir} ({leftover_gb:.1f} GB) -- not part of this session, "
+            f"safe to delete.")
+    # Previous sessions' segments are already baked into that session's
+    # output files; clear them so segments/ only ever holds this session.
+    for stale in segments_dir.glob("*_tl.mp4"):
+        try:
+            os.remove(stale)
+        except OSError:
+            pass
+
     proc = start_live_capture(camera, chunks_dir, chunk_seconds)
     log(f"Live timelapse started for '{camera.name}': {chunk_seconds // 60}-minute "
-        f"chunks at {speedup:g}x speed. Outputs: {last_hour} and {session_file}. "
-        f"Raw chunks are kept (roughly 4 GB/hour of disk on a 4K stream).")
+        f"chunks at {speedup:g}x speed, 1080p {LIVE_OUTPUT_FPS}fps output. "
+        f"Outputs: {last_hour} and {session_file}. "
+        f"Raw chunks are deleted once converted.")
 
     session_segments: List[Path] = []
-    processed: set = set()
 
     def process_chunks(include_newest: bool) -> None:
         chunks = sorted(chunks_dir.glob("*.ts"))
@@ -171,12 +199,16 @@ def run_live(camera: Camera, stop_event: threading.Event,
             except Exception as e:
                 log(f"Live: updating outputs failed: {e}")
                 continue
-            raw_gb = sum(c.stat().st_size for c in chunks_dir.glob("*.ts")) / 1e9
+            try:
+                os.remove(chunk)  # converted and stitched -- raw copy done
+            except OSError as e:
+                log(f"Live: couldn't delete converted chunk {chunk.name}: {e}")
+            seg_mb = sum(s.stat().st_size for s in session_segments if s.exists()) / 1e6
             log(f"Live: {chunk.name} done -> window "
                 f"{min(len(session_segments), window_chunks)}/{window_chunks} chunks, "
-                f"session {len(session_segments)} chunks, raw video {raw_gb:.1f} GB")
+                f"session {len(session_segments)} chunks, {seg_mb:.0f} MB of segments")
             if status:
-                status(len(session_segments), raw_gb)
+                status(len(session_segments), seg_mb)
 
     while not stop_event.is_set():
         if proc.poll() is not None:

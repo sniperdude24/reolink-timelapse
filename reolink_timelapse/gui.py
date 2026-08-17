@@ -229,7 +229,8 @@ class App:
 
     def _scan_latest_videos(self) -> list:
         """[(mtime, path, recording_name)] for the newest ~20 built videos
-        across every recording's output folder."""
+        across every recording's output folder, oldest first so the newest
+        video sits at the bottom of the list."""
         entries = []
         for name, r in self.config.recordings.items():
             out = Path(r.output_dir)
@@ -241,7 +242,7 @@ class App:
                 except OSError:
                     continue
         entries.sort(reverse=True)
-        return entries[:20]
+        return entries[:20][::-1]
 
     def _refresh_videos_tree(self) -> None:
         # Rebuild only when the file set actually changed, so the panel
@@ -370,7 +371,8 @@ class App:
     # ---- logging (thread-safe: workers push, only the main thread touches the widget) ----
 
     def log(self, msg: str) -> None:
-        self.log_queue.put(msg)
+        # Timestamp when the event happened, not when the queue drains.
+        self.log_queue.put(f"[{dt.datetime.now():%H:%M:%S}] {msg}")
 
     def _drain_log_queue(self) -> None:
         if self._closed:
@@ -527,9 +529,9 @@ class App:
         self.config.live_camera = name
         self.config.save()
 
-        def status_cb(chunks: int, raw_gb: float) -> None:
+        def status_cb(chunks: int, seg_mb: float) -> None:
             # worker thread -> whole-dict swap; the status loop only reads
-            self.live_state = {"chunks": chunks, "gb": raw_gb, "updated": dt.datetime.now()}
+            self.live_state = {"chunks": chunks, "mb": seg_mb, "updated": dt.datetime.now()}
 
         stop_event = threading.Event()
         thread = threading.Thread(
@@ -574,7 +576,7 @@ class App:
             st = self.live_state
             if st.get("updated"):
                 text = (f"Live -- updated {st['updated']:%H:%M:%S}, "
-                        f"{st['chunks']} chunks, {st['gb']:.1f} GB raw video")
+                        f"{st['chunks']} chunks, {st['mb']:.0f} MB of segments")
             else:
                 text = "Live -- waiting for the first chunk..."
         else:
