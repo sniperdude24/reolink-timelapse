@@ -115,12 +115,20 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         data = self._load()
         if data is not None:
-            self._respond(data, head_only=True)
+            try:
+                self._respond(data, head_only=True)
+            except (ConnectionError, OSError):
+                pass
 
 
 def start_stream_server(log: Callable[[str], None] = print) -> None:
     """Start the server on a daemon thread. Idempotent; a busy port is
-    logged and tolerated -- the app must keep working without the server."""
+    logged and tolerated -- the app must keep working without the server.
+
+    If the serving thread ever dies, that is logged and the dead server is
+    forgotten, so the next call here brings it back -- the Watch in VLC
+    button calls this before every launch for exactly that reason.
+    """
     global _server
     with _server_lock:
         if _server is not None:
@@ -131,5 +139,21 @@ def start_stream_server(log: Callable[[str], None] = print) -> None:
             log(f"Live stream server not started (port {STREAM_PORT}): {e}")
             return
         server.daemon_threads = True
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        threading.Thread(target=_serve, args=(server, log), daemon=True).start()
         _server = server
+
+
+def _serve(server: ThreadingHTTPServer, log: Callable[[str], None]) -> None:
+    global _server
+    try:
+        server.serve_forever()
+    except Exception as e:
+        log(f"Live stream server stopped unexpectedly: {e}")
+    finally:
+        try:
+            server.server_close()
+        except OSError:
+            pass
+        with _server_lock:
+            if _server is server:
+                _server = None

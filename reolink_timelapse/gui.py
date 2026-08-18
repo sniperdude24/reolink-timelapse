@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import threading
 import tkinter as tk
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import messagebox, ttk
@@ -91,6 +92,7 @@ class App:
         # the UI loop only reads, so no locking is needed.
         self.live_workers: dict[str, RunningCapture] = {}
         self.live_state: dict[str, dict] = {}
+        self.vlc_procs: dict[str, object] = {}
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self._closed = False
         self._closing = False
@@ -652,7 +654,31 @@ class App:
                 f"No live video for '{name}' yet -- start it and wait for the first chunk.",
             )
             return
+        prev = self.vlc_procs.get(name)
+        if prev is not None and prev.poll() is None:
+            messagebox.showinfo(
+                "Watch in VLC",
+                f"VLC is already watching '{name}' -- check your open windows.",
+            )
+            return
         url = stream_url(name)
+        # Prove the stream answers before handing it to VLC. A looping VLC
+        # retries an unreachable URL with zero delay -- a storm of window
+        # flashes and error popups -- so never launch it on a dead stream.
+        # start_stream_server also revives the server if it ever died.
+        start_stream_server(log=self.log)
+        try:
+            req = urllib.request.Request(url, method="HEAD")
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except Exception as e:
+            messagebox.showerror(
+                "Watch in VLC",
+                f"The live stream isn't answering, so VLC wasn't launched.\n\n"
+                f"{e}\n\nCheck the log panel for stream server messages, "
+                f"then try again.",
+            )
+            return
         vlc = shutil.which("vlc")
         if vlc is None:
             for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
@@ -667,7 +693,10 @@ class App:
                 f"Stream, paste this address, and turn on Loop:\n\n{url}",
             )
             return
-        subprocess.Popen([vlc, "--loop", url], **no_console_kwargs())
+        # --no-interact: no dialog popups from VLC; a playback problem
+        # shows in its window instead of spamming the desktop.
+        self.vlc_procs[name] = subprocess.Popen(
+            [vlc, "--loop", "--no-interact", url], **no_console_kwargs())
         self.log(f"Watching '{name}' in VLC via {url} -- looping, so each pass "
                  f"plays the newest hour.")
 
