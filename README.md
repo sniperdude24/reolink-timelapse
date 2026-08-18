@@ -1,11 +1,37 @@
 # reolink-timelapse
 
-Records an RTSP stream from an IP camera (Reolink or otherwise) — or from
-your NVR — only during your chosen schedule, and turns it into a timelapse
-video. Built to drive any number of independent **cameras** and
-**recordings** — different cameras, different locations, different
-schedules, even several recordings off the same camera — from one
-config-driven install rather than a one-off script per camera.
+Turn a Reolink security camera into a time-lapse movie maker. It quietly
+watches your camera's video feed and condenses hours of footage into short
+videos you can actually enjoy — a whole hour becomes about a minute of
+smooth, sped-up video. It keeps two movies fresh as it runs: one showing
+the last hour and one covering the current six-hour stretch, which is
+saved and dated before the next begins — so a full day becomes a small
+library of watchable clips instead of endless raw footage. You can even
+open the live view in VLC and leave it running like a self-refreshing
+window into your yard. Everything is automatic: old footage is tidied up
+as it goes, finished videos are named by date and time, and nothing you'd
+want to keep is ever recorded over.
+
+Under the hood it records RTSP video on your chosen schedule and drives
+any number of independent **cameras** and **recordings** — different
+cameras, different schedules, even several recordings off the same camera
+— from one config-driven install. It speaks **Reolink's** RTSP address
+format, so it works with Reolink cameras and NVR channels; other brands
+would need a small change.
+
+## Download and go (Windows)
+
+1. Grab the newest `reolink-timelapse-win64-*.zip` from
+   [Releases](https://github.com/sniperdude24/reolink-timelapse/releases)
+   and unzip it anywhere.
+2. Double-click `reolink-timelapse-gui.exe`. Windows SmartScreen may warn
+   about an unrecognized app the first time (the exe isn't code-signed) —
+   click **More info → Run anyway**.
+3. Click **Add Camera**, enter your camera's (or NVR channel's) IP,
+   username and password — then select it in the list and press **Start**.
+
+That's it: the live timelapse starts building, and **Watch in VLC** opens
+a self-updating view if VLC is installed.
 
 ## Requirements
 
