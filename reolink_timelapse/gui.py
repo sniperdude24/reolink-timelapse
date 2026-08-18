@@ -72,6 +72,46 @@ def _fmt_time(t: dt.datetime) -> str:
     return t.strftime("%I:%M %p").lstrip("0")
 
 
+def _vlc_is_healthy(vlc_path: str) -> bool:
+    """A VLC that can't display video is worse than none: it opens, fails
+    to create a video output ~16x/second, and repeat/loop turns that into
+    a window-flashing storm. Seen in the wild: a half-uninstalled VLC at
+    the default path with its entire plugins\\video_output folder missing,
+    while the user's real, registered VLC lived elsewhere."""
+    return (Path(vlc_path).parent / "plugins" / "video_output").is_dir()
+
+
+def _find_vlc() -> Optional[str]:
+    """Locate a working vlc.exe: the registry's App Paths entry (what
+    Windows itself launches -- follows the actual install location), then
+    PATH, then the default install folders. Unhealthy candidates are
+    skipped rather than trusted."""
+    candidates = []
+    try:
+        import winreg
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                key = r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\vlc.exe"
+                with winreg.OpenKey(root, key) as k:
+                    path = winreg.QueryValueEx(k, None)[0]
+                if path:
+                    candidates.append(path)
+            except OSError:
+                pass
+    except ImportError:
+        pass
+    which = shutil.which("vlc")
+    if which:
+        candidates.append(which)
+    for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+        if base:
+            candidates.append(os.path.join(base, "VideoLAN", "VLC", "vlc.exe"))
+    for c in candidates:
+        if os.path.isfile(c) and _vlc_is_healthy(c):
+            return c
+    return None
+
+
 @dataclass
 class RunningCapture:
     thread: threading.Thread
@@ -679,20 +719,16 @@ class App:
                 f"then try again.",
             )
             return
-        vlc = shutil.which("vlc")
-        if vlc is None:
-            for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
-                candidate = os.path.join(base or "", "VideoLAN", "VLC", "vlc.exe")
-                if base and os.path.isfile(candidate):
-                    vlc = candidate
-                    break
+        vlc = _find_vlc()
         if vlc is None:
             messagebox.showinfo(
                 "Watch in VLC",
-                "VLC wasn't found on this PC. In VLC choose Media > Open Network "
+                "No working VLC was found on this PC (installs missing their "
+                "video plugins are skipped). In VLC choose Media > Open Network "
                 f"Stream, paste this address, and turn on Loop:\n\n{url}",
             )
             return
+        self.log(f"Using VLC at {vlc}")
         # --no-interact: no dialog popups from VLC; a playback problem
         # shows in its window instead of spamming the desktop.
         self.vlc_procs[name] = subprocess.Popen(
