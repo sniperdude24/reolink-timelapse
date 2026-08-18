@@ -40,12 +40,11 @@ def app_root_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def default_setup_dirs(name: str) -> tuple[Path, Path]:
-    """The (frames_dir, output_dir) for a recording, always under the
-    program folder's Timelapses/<name>/. The one place this is computed --
-    everything else derives storage from here."""
-    base = app_root_dir() / "Timelapses" / name
-    return base / "frames", base
+def default_output_dir(name: str) -> Path:
+    """A recording's storage root, always the program folder's
+    Timelapses/<name>/. The one place this is computed -- everything else
+    derives storage from here."""
+    return app_root_dir() / "Timelapses" / name
 
 
 def default_config_path() -> Path:
@@ -89,7 +88,6 @@ class Setup:
     channel: int = 1
     substream: bool = True
     interval: float = 30
-    frames_dir: str = "frames"
     output_dir: str = "."
     output_fps: float = 30
     target_video_seconds: Optional[int] = None
@@ -139,12 +137,8 @@ class Recording:
     schedule: Schedule = field(default_factory=Schedule)
 
     @property
-    def frames_dir(self) -> str:
-        return str(default_setup_dirs(self.name)[0])
-
-    @property
     def output_dir(self) -> str:
-        return str(default_setup_dirs(self.name)[1])
+        return str(default_output_dir(self.name))
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "Recording":
@@ -164,7 +158,7 @@ class Recording:
         return Setup(
             name=self.name, ip=camera.ip, user=camera.user, password=camera.password,
             port=camera.port, channel=camera.channel, substream=camera.substream,
-            interval=self.interval, frames_dir=self.frames_dir, output_dir=self.output_dir,
+            interval=self.interval, output_dir=self.output_dir,
             output_fps=self.output_fps, target_video_seconds=self.target_video_seconds,
             schedule=self.schedule,
         )

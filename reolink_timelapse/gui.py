@@ -19,7 +19,7 @@ from zoneinfo import available_timezones
 
 import tzlocal
 
-from .build import build_timelapse
+from . import __version__
 from .chunks import refresh_output
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .live import live_dirs, run_live
@@ -121,7 +121,7 @@ class RunningCapture:
 class App:
     def __init__(self, root: tk.Tk):
         self.root = root
-        root.title("Reolink Timelapse")
+        root.title(f"Reolink Timelapse v{__version__}")
         root.geometry("1200x620")
         root.protocol("WM_DELETE_WINDOW", self.on_close)
 
@@ -1397,10 +1397,11 @@ class LocationMapDialog(tk.Toplevel):
         self.destroy()
 
 
-ALL_SESSIONS = "All sessions (entire history)"
-
-
 class BuildDialog(tk.Toplevel):
+    """Rebuild a recorded session's video: a lossless concat of the clips
+    rendered while it captured. Pacing and fps were fixed at capture time,
+    so the only choice is which session."""
+
     def __init__(self, parent, setup, log):
         super().__init__(parent)
         self.setup = setup
@@ -1413,64 +1414,23 @@ class BuildDialog(tk.Toplevel):
         pad = {"padx": 6, "pady": 4}
         row = 0
 
-        def add_row(label: str, widget) -> int:
-            nonlocal row
-            ttk.Label(self, text=label).grid(row=row, column=0, sticky="e", **pad)
-            widget.grid(row=row, column=1, sticky="we", **pad)
-            row += 1
-            return row
-
-        # Sessions newest-first, defaulting to the most recent one. Building
-        # "everything ever captured" when the user just wants the session
-        # they recorded produced videos that opened with frames from long
-        # before -- make session scope the explicit, default choice.
+        # Sessions newest-first, defaulting to the most recent one.
         self.sessions = self._list_sessions()
-        scope_values = [label for label, _ in self.sessions] + [ALL_SESSIONS]
-        self.scope_var = tk.StringVar(value=scope_values[0])
+        scope_values = [label for label, _ in self.sessions]
+        self.scope_var = tk.StringVar(value=scope_values[0] if scope_values else "")
+        ttk.Label(self, text="Session to build").grid(row=row, column=0, sticky="e", **pad)
         self.scope_combo = ttk.Combobox(
             self, textvariable=self.scope_var, state="readonly",
             values=scope_values, width=34,
         )
-        add_row("Session to build", self.scope_combo)
-        self.scope_combo.bind("<<ComboboxSelected>>", lambda _e: self._toggle_smooth())
-
-        self.fps_var = tk.StringVar(value=f"{setup.output_fps:g}")
-        self.fps_entry = ttk.Entry(self, textvariable=self.fps_var)
-        add_row("Output fps", self.fps_entry)
-
-        self.smooth_var = tk.BooleanVar(value=False)
-        self.base_fps_var = tk.StringVar(value="5")
-        smooth_frame = ttk.Frame(self)
-        self.smooth_check = ttk.Checkbutton(
-            smooth_frame, text="Smooth motion (interpolate in-between frames)",
-            variable=self.smooth_var, command=self._toggle_smooth,
-        )
-        self.smooth_check.pack(anchor="w")
-        base_row = ttk.Frame(smooth_frame)
-        base_row.pack(anchor="w")
-        ttk.Label(base_row, text="Real frames per second:").pack(side="left")
-        self.base_fps_entry = ttk.Entry(base_row, textvariable=self.base_fps_var, width=6)
-        self.base_fps_entry.pack(side="left", padx=4)
-        add_row("Smoothing", smooth_frame)
+        self.scope_combo.grid(row=row, column=1, sticky="we", **pad)
+        row += 1
+        self.scope_combo.bind("<<ComboboxSelected>>", lambda _e: self._update_build_estimate())
 
         self.est_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.est_var, foreground="gray").grid(
             row=row, column=0, columnspan=2, sticky="w", padx=6)
         row += 1
-        self.fps_var.trace_add("write", self._update_build_estimate)
-        self.base_fps_var.trace_add("write", self._update_build_estimate)
-
-        self.date_var = tk.StringVar(value="")
-        self.date_entry = ttk.Entry(self, textvariable=self.date_var)
-        add_row("Single date (YYYY-MM-DD, optional)", self.date_entry)
-
-        self.start_date_var = tk.StringVar(value="")
-        self.start_date_entry = ttk.Entry(self, textvariable=self.start_date_var)
-        add_row("Start date (optional)", self.start_date_entry)
-
-        self.end_date_var = tk.StringVar(value="")
-        self.end_date_entry = ttk.Entry(self, textvariable=self.end_date_var)
-        add_row("End date (optional)", self.end_date_entry)
 
         self.status_var = tk.StringVar(value="")
         ttk.Label(self, textvariable=self.status_var).grid(row=row, column=0, columnspan=2, **pad)
@@ -1482,24 +1442,18 @@ class BuildDialog(tk.Toplevel):
         self.build_btn.pack(side="left", padx=4)
         ttk.Button(btn_frame, text="Close", command=self.destroy).pack(side="left", padx=4)
 
-        # After every widget exists -- this gates field states by scope.
-        self._toggle_smooth()
+        if not self.sessions:
+            self.est_var.set("No recorded sessions with clips yet -- run this "
+                             "recording once first.")
+            self.build_btn.configure(state="disabled")
+        else:
+            self._update_build_estimate()
 
     def _list_sessions(self) -> list:
-        """[(label, path)] for buildable sessions, newest first.
-
-        Two kinds coexist. Recordings made by the current version capture
-        video and render segments as they go, so rebuilding is a lossless
-        concat -- their pacing is already baked in. Sessions captured by
-        older versions are loose JPEGs and still go through
-        build_timelapse, which can re-time and smooth them. `_scope_kind`
-        records which is which so the dialog can enable the right fields.
-        """
+        """[(label, path)] for buildable sessions, newest first. Each is a
+        session folder holding the clips rendered while it captured."""
         sessions = []
         self._scope_counts: dict = {}
-        self._scope_kind: dict = {}
-
-        # Newer, segment-based sessions first (they're the recent ones).
         seg_root = Path(self.setup.output_dir) / "sessions"
         if seg_root.is_dir():
             for d in sorted((p for p in seg_root.iterdir() if p.is_dir()), reverse=True):
@@ -1514,147 +1468,34 @@ class BuildDialog(tk.Toplevel):
                 label = f"Session {when} ({len(segs)} clips)"
                 sessions.append((label, str(d)))
                 self._scope_counts[label] = len(segs)
-                self._scope_kind[label] = "segments"
-
-        root = Path(self.setup.frames_dir)
-        total = 0
-        if root.is_dir():
-            total = sum(1 for _ in root.glob("*.jpg"))  # legacy loose frames
-            for d in sorted((p for p in root.iterdir() if p.is_dir()), reverse=True):
-                count = sum(1 for _ in d.glob("*.jpg"))
-                if not count:
-                    continue
-                try:
-                    started = dt.datetime.strptime(d.name[:15], "%Y%m%d_%H%M%S")
-                    label = f"Session {started:%Y-%m-%d %H:%M} ({count} frames)"
-                except ValueError:
-                    label = f"Session {d.name} ({count} frames)"
-                sessions.append((label, str(d)))
-                self._scope_counts[label] = count
-                self._scope_kind[label] = "frames"
-                total += count
-        self._scope_counts[ALL_SESSIONS] = total
-        self._scope_kind[ALL_SESSIONS] = "frames"
         return sessions
 
-    def _scope_is_segments(self) -> bool:
-        return self._scope_kind.get(self.scope_var.get()) == "segments"
-
-    def _toggle_smooth(self) -> None:
-        """Enable only the fields that mean something for the current scope.
-
-        For a segment-based session the capture interval and fps were fixed
-        when it was recorded, and rebuilding just re-joins the rendered
-        clips -- so offering fps, smoothing or date filters there would be
-        a lie. Legacy JPEG sessions keep the full set.
-        """
-        segments = self._scope_is_segments()
-        for widget in (self.fps_entry, self.smooth_check,
-                       self.date_entry, self.start_date_entry, self.end_date_entry):
-            widget.configure(state="disabled" if segments else "normal")
-        smooth_on = self.smooth_var.get() and not segments
-        self.base_fps_entry.configure(state="normal" if smooth_on else "disabled")
-        self._update_build_estimate()
-
     def _update_build_estimate(self, *_args) -> None:
-        frames = self._scope_counts.get(self.scope_var.get(), 0)
-        if self._scope_is_segments():
-            self.est_var.set(
-                f"Joins {frames} recorded clip(s) as-is -- speed and fps were "
-                f"set when this session was captured."
-            )
-            return
-        try:
-            fps = float(self.fps_var.get())
-            if fps <= 0:
-                raise ValueError
-        except ValueError:
-            self.est_var.set("")
-            return
-        if self.smooth_var.get():
-            base = _parse_optional_float(self.base_fps_var.get())
-            if not base or not 0 < base < fps:
-                self.est_var.set("Real frames per second must be above 0 and below the output fps.")
-                return
-            self.est_var.set(
-                f"~{frames / base:.1f}s of smoothed video from {frames} frames "
-                f"({base:g} real fps interpolated to {fps:g} fps) -- renders much slower"
-            )
-            return
-        self.est_var.set(f"~{frames / fps:.1f}s of video from {frames} frames at {fps:g} fps")
-
-    def _parse_date(self, s: str) -> Optional[dt.date]:
-        s = s.strip()
-        return dt.date.fromisoformat(s) if s else None
+        clips = self._scope_counts.get(self.scope_var.get(), 0)
+        self.est_var.set(
+            f"Joins {clips} recorded clip(s) as-is -- speed and fps were "
+            f"set when this session was captured."
+        )
 
     def _start_build(self) -> None:
         scope = self.scope_var.get()
-        if self._scope_is_segments():
-            session_dir = next((p for label, p in self.sessions if label == scope), None)
-            self.build_btn.configure(state="disabled")
-            self.status_var.set("Joining clips...")
-            self.log(f"Rebuilding video for '{self.setup.name}' ({scope})...")
-            self._result_queue = queue.Queue()
-            threading.Thread(target=self._segment_worker,
-                             args=(session_dir,), daemon=True).start()
-            self.after(100, self._poll_result)
+        session_dir = next((p for label, p in self.sessions if label == scope), None)
+        if session_dir is None:
             return
-
-        try:
-            fps = float(self.fps_var.get())
-            single_date = self._parse_date(self.date_var.get())
-            start_date = single_date or self._parse_date(self.start_date_var.get())
-            end_date = single_date or self._parse_date(self.end_date_var.get())
-        except ValueError:
-            messagebox.showerror("Invalid", "Check the fps/date fields (dates must be YYYY-MM-DD).")
-            return
-
-        smooth_base_fps = None
-        if self.smooth_var.get():
-            smooth_base_fps = _parse_optional_float(self.base_fps_var.get())
-            if not smooth_base_fps or not 0 < smooth_base_fps < fps:
-                messagebox.showerror(
-                    "Invalid",
-                    "Real frames per second must be greater than 0 and less than "
-                    "the output fps.",
-                )
-                return
-
-        frames_dir = next((path for label, path in self.sessions if label == scope), None)
-
         self.build_btn.configure(state="disabled")
-        self.status_var.set("Building...")
-        self.log(f"Building video for '{self.setup.name}' ({scope})"
-                 + (" with motion smoothing..." if smooth_base_fps else "..."))
-
+        self.status_var.set("Joining clips...")
+        self.log(f"Rebuilding video for '{self.setup.name}' ({scope})...")
         self._result_queue: "queue.Queue[tuple]" = queue.Queue()
-        threading.Thread(
-            target=self._worker,
-            args=(fps, start_date, end_date, frames_dir, smooth_base_fps), daemon=True,
-        ).start()
+        threading.Thread(target=self._segment_worker,
+                         args=(session_dir,), daemon=True).start()
         self.after(100, self._poll_result)
 
-    def _worker(self, fps: float, start_date, end_date, frames_dir: Optional[str],
-                smooth_base_fps: Optional[float]) -> None:
-        # Runs on a background thread -- must never touch Tk widgets directly,
-        # only hand the result to the main thread via the queue. Calling
-        # self.after() from here intermittently raised "main thread is not
-        # in main loop" (Tk requires after()/widget access from the thread
-        # actually running mainloop), caught while testing the build flow.
-        try:
-            out = build_timelapse(
-                self.setup, output_fps=fps, start_date=start_date, end_date=end_date,
-                frames_dir=frames_dir, smooth_base_fps=smooth_base_fps,
-            )
-            self._result_queue.put((out, None))
-        except (SystemExit, Exception) as e:
-            self._result_queue.put((None, str(e)))
-
     def _segment_worker(self, session_dir: Optional[str]) -> None:
-        """Rebuild a segment-based session: a lossless concat of its clips.
+        """Rebuild a session: a lossless concat of its rendered clips.
 
-        Same background-thread rule as _worker -- hand results back through
-        the queue, never touch Tk from here.
+        Runs on a background thread -- hand results back through the
+        queue, never touch Tk from here (widget access off the mainloop
+        thread intermittently raises "main thread is not in main loop").
         """
         try:
             segments = sorted(Path(session_dir).joinpath("segments").glob("*_tl.mp4"))

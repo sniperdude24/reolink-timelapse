@@ -49,7 +49,7 @@ just swap the command:
 .\dist\reolink-timelapse\reolink-timelapse.exe configure backyard
 .\dist\reolink-timelapse\reolink-timelapse.exe record backyard --camera backyard
 .\dist\reolink-timelapse\reolink-timelapse.exe run backyard
-.\dist\reolink-timelapse\reolink-timelapse.exe build backyard --output-fps 24
+.\dist\reolink-timelapse\reolink-timelapse.exe build backyard
 ```
 
 ## Install (from source)
@@ -88,16 +88,11 @@ or a terminal you don't close):
 python -m reolink_timelapse run backyard
 ```
 
-Build a video from what's been captured so far:
+Rebuild the newest recorded session's video (a lossless rejoin of its
+clips — sessions also build themselves automatically when they end):
 
 ```bash
-python -m reolink_timelapse build backyard --output-fps 24
-```
-
-Build just one day's video:
-
-```bash
-python -m reolink_timelapse build backyard --date 2026-08-15
+python -m reolink_timelapse build backyard
 ```
 
 List, or remove a camera/recording:
@@ -163,29 +158,6 @@ Capture pacing works one of two ways:
 - **Set the interval manually**: one frame every N seconds. The dialog
   shows a live estimate of how long the finished video will come out for
   the current schedule, interval, and fps.
-
-The Build Video dialog also shows the estimated output length for whichever
-session (or the whole history) you've selected at the chosen fps.
-
-### Motion smoothing
-
-When building a video you can optionally **smooth motion** by having
-ffmpeg synthesize in-between frames (motion interpolation): tick "Smooth
-motion" in the Build Video dialog and set how many **real** frames play
-per second (e.g. 5). Each captured frame then anchors that much time and
-the gaps are filled with interpolated frames up to the output fps — so 60
-captured frames at 5 real fps become a fluid 12-second video at 30 fps,
-instead of a jerky 2-second one. From the CLI:
-
-```bash
-python -m reolink_timelapse build backyard --output-fps 30 --smooth-fps 5
-```
-
-Interpolation renders much slower than a plain build (motion estimation
-runs on every frame — expect minutes rather than seconds for 4K), and
-fast-moving objects can shimmer slightly where frames are synthesized.
-Automatic end-of-session builds stay plain; smoothing is a per-build
-choice.
 
 ## Live rolling timelapse
 
@@ -298,10 +270,11 @@ The session's video is then a fast, lossless join of those clips, named
 folder, which stays flat — only the working files get split per session.
 
 **Rebuilding.** "Build Video..." (or `build <name>`) rejoins a session's
-clips. Because the capture interval and fps were fixed when the session was
-recorded, the fps, smoothing and date fields don't apply to these sessions
-and are greyed out. Sessions captured by older versions are loose JPEG
-frames and still build the old way, with all of those options available.
+clips losslessly. The capture interval and fps were fixed when the session
+was recorded, so there's nothing to configure beyond picking the session.
+(Frame-by-frame JPEG sessions from v0.11 and older are no longer
+buildable by this version — use the old version's exe alongside them if
+one ever needs rebuilding; their already-built videos play fine.)
 
 ## Where things are stored
 
@@ -322,9 +295,9 @@ or a USB drive as a single unit. There's nothing to configure:
   small rendered clips, kept so the video can be rejoined).
 - **Finished videos** save to `<program folder>\Timelapses\<recording-name>\`
   — always, derived from the recording's name. (Older versions let these
-  be customized per recording; any previously customized folders are left
-  in place on disk but are no longer read or written. Old `frames\`
-  folders are also left alone and remain buildable.)
+  be customized per recording; any previously customized folders — and old
+  `frames\` folders — are left in place on disk but are no longer read or
+  written.)
 
 Note for source runs: `config.yaml` (which holds plaintext camera
 credentials) ends up sitting directly in the repo working directory. It's

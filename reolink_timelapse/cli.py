@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Optional
 
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
-from .build import build_timelapse
 from .chunks import refresh_output
 from .scheduler import daylight_window, run_scheduled
 
@@ -275,12 +274,10 @@ def cmd_live(args: argparse.Namespace) -> None:
 
 
 def _rebuild_latest_session(setup) -> bool:
-    """Rejoin the newest segment-based session, if there is one.
+    """Rejoin the newest recorded session, if there is one.
 
     Recordings capture video and render clips as they go, so rebuilding one
-    is a lossless concat -- its pacing was fixed at capture time and the
-    fps/date options don't apply. Returns False when there's no such
-    session, leaving the legacy JPEG path to handle it.
+    is a lossless concat -- its pacing was fixed at capture time.
     """
     root = Path(setup.output_dir) / "sessions"
     if not root.is_dir():
@@ -300,23 +297,9 @@ def _rebuild_latest_session(setup) -> bool:
 def cmd_build(args: argparse.Namespace) -> None:
     config = _open_config()
     setup = config.resolved(args.name)
-    # Prefer the modern path; fall back to building from legacy JPEG frames.
-    if not any([args.date, args.start_date, args.end_date, args.smooth_fps,
-                args.output_file]) and _rebuild_latest_session(setup):
-        return
-    start_date = dt.date.fromisoformat(args.start_date) if args.start_date else None
-    end_date = dt.date.fromisoformat(args.end_date) if args.end_date else None
-    if args.date:
-        start_date = end_date = dt.date.fromisoformat(args.date)
-    out = build_timelapse(
-        setup,
-        output_fps=args.output_fps,
-        output_file=args.output_file,
-        start_date=start_date,
-        end_date=end_date,
-        smooth_base_fps=args.smooth_fps,
-    )
-    print(f"\nDone! Saved to: {out}")
+    if not _rebuild_latest_session(setup):
+        sys.exit(f"ERROR: no recorded sessions with rendered clips found for "
+                 f"'{args.name}' -- run it once first.")
 
 
 def cmd_gui(args: argparse.Namespace) -> None:
@@ -365,17 +348,9 @@ def main() -> None:
     p = sub.add_parser("gui", help="Launch the graphical control panel")
     p.set_defaults(func=cmd_gui)
 
-    p = sub.add_parser("build", help="Build an mp4 timelapse from captured frames")
+    p = sub.add_parser("build", help="Rejoin the newest recorded session into an mp4 "
+                                      "(lossless -- pacing was fixed at capture time)")
     p.add_argument("name")
-    p.add_argument("--output-fps", type=float, default=30, help="Playback fps (default: 30)")
-    p.add_argument("--smooth-fps", type=float, default=None,
-                    help="Motion-smooth the video: treat captured frames as this many "
-                         "real frames per second and interpolate in-between frames up "
-                         "to --output-fps (must be below it). Renders much slower.")
-    p.add_argument("--output-file", default=None, help="Output path (default: auto-named)")
-    p.add_argument("--date", default=None, help="Only include frames from this date (YYYY-MM-DD)")
-    p.add_argument("--start-date", default=None, help="Only include frames on/after this date")
-    p.add_argument("--end-date", default=None, help="Only include frames on/before this date")
     p.set_defaults(func=cmd_build)
 
     args = parser.parse_args()
