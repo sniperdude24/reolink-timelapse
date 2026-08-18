@@ -5,11 +5,12 @@ the capturing and rendering; what makes this "live" is the pair of
 always-current outputs it maintains:
 
 - last_hour.mp4: the trailing window (newest 12 chunks), oldest falls off
-- session.mp4: everything since this live session started
+- session.mp4: the 6-hour block in progress
 
 Both are written to a temp file and os.replace()d, so opening one never
 catches a half-written video. The view lags real time by at most one
-chunk.
+chunk. On stop, both are renamed into sessions/ under dated names --
+nothing watchable is ever overwritten by the next start.
 
 Disk stays flat by design (user's choice, revised from an earlier
 keep-everything policy): each raw chunk is deleted as soon as its segment
@@ -58,16 +59,16 @@ def _segment_time(segment: Path) -> Optional[dt.datetime]:
         return None
 
 
-def _block_filename(camera_name: str, segments: List[Path]) -> str:
-    """`<camera>_<date>_<HHhMM>-<HHhMM>.mp4` for a finished block, using the
-    same %Hh%M label convention as scheduled recordings."""
+def _block_filename(camera_name: str, segments: List[Path], suffix: str = "") -> str:
+    """`<camera>_<date>_<HHhMM>-<HHhMM><suffix>.mp4` for a finished block,
+    using the same %Hh%M label convention as scheduled recordings."""
     start = _segment_time(segments[0])
     end = _segment_time(segments[-1])
     if start is None:
-        return f"{camera_name}_{dt.datetime.now():%Y-%m-%d_%Hh%M}.mp4"
+        return f"{camera_name}_{dt.datetime.now():%Y-%m-%d_%Hh%M}{suffix}.mp4"
     end = end or start
     return (f"{camera_name}_{start:%Y-%m-%d}_"
-            f"{start:%Hh%M}-{end:%Hh%M}.mp4")
+            f"{start:%Hh%M}-{end:%Hh%M}{suffix}.mp4")
 
 
 def run_live(camera: Camera, stop_event: threading.Event,
@@ -108,19 +109,21 @@ def run_live(camera: Camera, stop_event: threading.Event,
             f"({leftover_gb:.1f} GB) -- not part of this session, safe to delete.")
     renderer.clear_stale(root)
 
-    # A session.mp4 still sitting here means the last run never closed its
-    # block (crash, power loss). Its segments are gone, so it can't be
-    # rebuilt -- move it into sessions/ rather than let the first refresh
-    # below overwrite real footage.
-    if session_file.exists():
+    # An output still sitting here means the last run never archived it
+    # (crash, power loss) -- a clean stop moves both into sessions/. Their
+    # segments are gone, so they can't be rebuilt: move them into sessions/
+    # rather than let the first refresh below overwrite real footage.
+    for orphan, kind in ((session_file, ""), (last_hour, "_lasthour")):
+        if not orphan.exists():
+            continue
         os.makedirs(sessions_dir, exist_ok=True)
-        stamp = dt.datetime.fromtimestamp(session_file.stat().st_mtime)
-        recovered = sessions_dir / f"{camera.name}_{stamp:%Y-%m-%d_%Hh%M}_recovered.mp4"
+        stamp = dt.datetime.fromtimestamp(orphan.stat().st_mtime)
+        recovered = sessions_dir / f"{camera.name}_{stamp:%Y-%m-%d_%Hh%M}{kind}_recovered.mp4"
         try:
-            os.replace(session_file, recovered)
-            log(f"Live: kept the previous run's unfinished session as {recovered.name}")
+            os.replace(orphan, recovered)
+            log(f"Live: kept the previous run's unfinished {orphan.name} as {recovered.name}")
         except OSError as e:
-            log(f"Live: couldn't preserve the previous session.mp4: {e}")
+            log(f"Live: couldn't preserve the previous {orphan.name}: {e}")
 
     # last_hour.mp4 must keep spanning a rotation boundary, so the newest
     # segments are tracked separately from the block they belong to. They
@@ -159,6 +162,19 @@ def run_live(camera: Camera, stop_event: threading.Event,
             return
         renderer.segments = []
         prune_segments()
+
+    def archive_last_hour() -> None:
+        """On stop, keep the final window view too: the next start's first
+        refresh would otherwise overwrite last_hour.mp4 with new footage."""
+        if not recent or not last_hour.exists():
+            return
+        os.makedirs(sessions_dir, exist_ok=True)
+        target = sessions_dir / _block_filename(camera.name, list(recent), "_lasthour")
+        try:
+            os.replace(last_hour, target)
+            log(f"Live: saved the final last-hour view as {target.name}")
+        except OSError as e:
+            log(f"Live: couldn't archive last_hour.mp4: {e}")
 
     def refresh_outputs(r: ChunkRenderer, final: bool) -> None:
         recent.append(r.segments[-1])
@@ -209,6 +225,7 @@ def run_live(camera: Camera, stop_event: threading.Event,
     # Close the partial block too, so stopping never leaves footage sitting
     # in a session.mp4 that the next run would overwrite.
     close_block("stopped")
+    archive_last_hour()
     log(f"Live timelapse for '{camera.name}' stopped."
         + (f" {renderer.failed} chunk(s) failed to convert and were kept."
            if renderer.failed else ""))

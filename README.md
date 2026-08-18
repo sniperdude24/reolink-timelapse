@@ -217,8 +217,28 @@ forever. Every 6 hours the session is closed off, renamed into
 `<camera>_<date>_<start>-<end>.mp4`, and a fresh one starts — so you get a
 series of watchable ~6-minute timelapses instead of an unopenable monolith.
 Closing a session is a rename, not a re-encode, so it costs nothing. Each
-completed block appears in **Latest Videos**, and stopping the live view
-closes off the partial session the same way.
+completed block appears in **Latest Videos**.
+
+**Stopping archives everything watchable.** Stop (or closing the program)
+closes off the partial session the same way, and also renames the final
+`last_hour.mp4` into `sessions\` as `<camera>_<date>_<start>-<end>_lasthour.mp4`
+— so the next Start never overwrites footage you might still want. If the
+program dies without a clean stop, whatever it left behind is preserved as
+`*_recovered.mp4` on the next start.
+
+### Watch live in VLC (self-updating)
+
+The **Watch in VLC** button opens the selected camera's last hour in VLC
+on a loop, served by a small built-in web server (localhost only —
+nothing is exposed to your network). Because it's looped over HTTP, every
+replay re-fetches the file: the view is about a minute long and refreshes
+itself with the newest footage on each pass, no clicking re-open. If VLC
+isn't installed where the app can find it, a dialog shows the address to
+paste into VLC's *Media > Open Network Stream* (turn on Loop).
+
+Watching over HTTP also means VLC never holds a lock on the file itself,
+so it can't stall the live refresh the way a player opening
+`last_hour.mp4` directly can.
 
 That cap is also what keeps `session.mp4` current: rebuilding it is a full
 re-mux, so on an uncapped session the cost grows with the square of how

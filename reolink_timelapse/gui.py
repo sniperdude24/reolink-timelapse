@@ -6,6 +6,8 @@ from __future__ import annotations
 import datetime as dt
 import os
 import queue
+import shutil
+import subprocess
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -20,7 +22,9 @@ from .build import build_timelapse
 from .chunks import refresh_output
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .live import live_dirs, run_live
+from .rtsp import no_console_kwargs
 from .scheduler import daylight_window, next_window, run_scheduled
+from .webstream import start_stream_server, stream_url
 
 _TIMEZONES = sorted(available_timezones())
 
@@ -95,6 +99,7 @@ class App:
         self._videos_cache: list = []
 
         self._build_widgets()
+        start_stream_server(log=self.log)
         if self.config.migrated_from:
             self.log(f"Migrated existing config from {self.config.migrated_from} to {self.config.path}.")
         if self.config.migration_error:
@@ -150,6 +155,8 @@ class App:
                    command=lambda: self.on_play_live("last_hour.mp4")).pack(side="left", padx=2)
         ttk.Button(live_run, text="Play Session",
                    command=lambda: self.on_play_live("session.mp4")).pack(side="left", padx=2)
+        ttk.Button(live_run, text="Watch in VLC",
+                   command=self.on_watch_live_vlc).pack(side="left", padx=2)
         ttk.Button(live_run, text="Open Folder",
                    command=self.on_open_live_folder).pack(side="left", padx=2)
 
@@ -627,6 +634,42 @@ class App:
             )
             return
         os.startfile(str(path))  # Windows only, same convention as Latest Videos
+
+    def on_watch_live_vlc(self) -> None:
+        """Open the last-hour feed in VLC through the local stream server.
+
+        The URL is looped, and every loop pass re-requests the file -- so
+        each replay shows the newest hour. Watching via HTTP (instead of
+        the file directly) also keeps VLC from holding a lock that would
+        block the live refresh.
+        """
+        name = self._selected_live_camera("watch")
+        if name is None:
+            return
+        if not (live_dirs(name)[2] / "last_hour.mp4").exists():
+            messagebox.showinfo(
+                "Live Timelapse",
+                f"No live video for '{name}' yet -- start it and wait for the first chunk.",
+            )
+            return
+        url = stream_url(name)
+        vlc = shutil.which("vlc")
+        if vlc is None:
+            for base in (os.environ.get("ProgramFiles"), os.environ.get("ProgramFiles(x86)")):
+                candidate = os.path.join(base or "", "VideoLAN", "VLC", "vlc.exe")
+                if base and os.path.isfile(candidate):
+                    vlc = candidate
+                    break
+        if vlc is None:
+            messagebox.showinfo(
+                "Watch in VLC",
+                "VLC wasn't found on this PC. In VLC choose Media > Open Network "
+                f"Stream, paste this address, and turn on Loop:\n\n{url}",
+            )
+            return
+        subprocess.Popen([vlc, "--loop", url], **no_console_kwargs())
+        self.log(f"Watching '{name}' in VLC via {url} -- looping, so each pass "
+                 f"plays the newest hour.")
 
     def on_open_live_folder(self) -> None:
         name = self._selected_live_camera("open")
