@@ -19,7 +19,7 @@ from zoneinfo import available_timezones
 
 import tzlocal
 
-from . import __version__
+from . import __version__, openfile
 from .chunks import refresh_output
 from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
 from .live import live_dirs, run_live
@@ -141,7 +141,9 @@ class App:
         self._videos_cache: list = []
 
         self._build_widgets()
-        start_stream_server(log=self.log)
+        start_stream_server(host=self.config.stream_bind_host, log=self.log)
+        self.log("Live stream server ready -- Watch in VLC uses it, or open "
+                 "http://<this address>:8177/live/<camera>/last_hour.mp4 in any player.")
         if self.config.migrated_from:
             self.log(f"Migrated existing config from {self.config.migrated_from} to {self.config.path}.")
         if self.config.migration_error:
@@ -335,14 +337,19 @@ class App:
             messagebox.showerror("Play Video", "That video no longer exists.")
             self._refresh_videos_tree()
             return
-        os.startfile(path)  # Windows only, matches this project's target platform
+        if not openfile.open_path(path):
+            messagebox.showinfo("Play Video", f"Couldn't open a player automatically. "
+                                              f"The video is at:\n{path}")
 
     def on_show_video_folder(self) -> None:
         path = self.selected_video()
         if not path:
             messagebox.showinfo("Show in Folder", "Select a video first.")
             return
-        os.startfile(os.path.dirname(path))
+        folder = os.path.dirname(path)
+        if not openfile.open_path(folder):
+            messagebox.showinfo("Show in Folder", f"Couldn't open a file manager "
+                                                   f"automatically. The folder is:\n{folder}")
 
     def _live_cells(self, name: str) -> tuple:
         """(status, chunks, segments, updated) for one camera's live row."""
@@ -599,7 +606,9 @@ class App:
             messagebox.showinfo("Open Folder", "Select a recording first.")
             return
         os.makedirs(recording.output_dir, exist_ok=True)
-        os.startfile(recording.output_dir)  # Windows only, matches this project's target platform
+        if not openfile.open_path(recording.output_dir):
+            messagebox.showinfo("Open Folder", f"Couldn't open a file manager "
+                                               f"automatically. The folder is:\n{recording.output_dir}")
 
     # ---- live timelapse ----
 
@@ -675,7 +684,9 @@ class App:
                 f"No live video for '{name}' yet -- start it and wait for the first chunk.",
             )
             return
-        os.startfile(str(path))  # Windows only, same convention as Latest Videos
+        if not openfile.open_path(str(path)):
+            messagebox.showinfo("Live Timelapse", f"Couldn't open a player automatically. "
+                                                   f"The video is at:\n{path}")
 
     def on_watch_live_vlc(self) -> None:
         """Open the last-hour feed in VLC through the local stream server.
@@ -701,12 +712,14 @@ class App:
                 f"VLC is already watching '{name}' -- check your open windows.",
             )
             return
-        url = stream_url(name)
         # Prove the stream answers before handing it to VLC. A looping VLC
         # retries an unreachable URL with zero delay -- a storm of window
         # flashes and error popups -- so never launch it on a dead stream.
-        # start_stream_server also revives the server if it ever died.
-        start_stream_server(log=self.log)
+        # start_stream_server also revives the server if it ever died; the
+        # URL must be read after this, not before, so a first-ever start
+        # reflects the host it actually bound rather than the stale default.
+        start_stream_server(host=self.config.stream_bind_host, log=self.log)
+        url = stream_url(name)
         try:
             req = urllib.request.Request(url, method="HEAD")
             with urllib.request.urlopen(req, timeout=5):
@@ -747,7 +760,9 @@ class App:
                 f"'{name}' has no live folder yet -- start it once to create one.",
             )
             return
-        os.startfile(str(root))
+        if not openfile.open_path(str(root)):
+            messagebox.showinfo("Live Timelapse", f"Couldn't open a file manager "
+                                                   f"automatically. The folder is:\n{root}")
 
     def _update_live_status(self) -> None:
         """Refresh each camera's live cells in place, only where changed."""

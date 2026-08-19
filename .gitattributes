@@ -1,0 +1,4 @@
+# Shell scripts must keep LF endings regardless of the checking-out
+# platform's autocrlf setting -- a CRLF shebang line fails on Linux with
+# "bad interpreter: /bin/bash^M: no such file or directory".
+*.sh text eol=lf

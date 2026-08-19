@@ -21,7 +21,8 @@ def resolve_ffmpeg() -> Optional[str]:
     isn't bundled in a source checkout.
     """
     if getattr(sys, "frozen", False):
-        bundled = app_root_dir() / "ffmpeg.exe"
+        name = "ffmpeg.exe" if sys.platform == "win32" else "ffmpeg"
+        bundled = app_root_dir() / name
         if bundled.exists():
             return str(bundled)
     return shutil.which("ffmpeg")
@@ -30,10 +31,13 @@ def resolve_ffmpeg() -> Optional[str]:
 def check_ffmpeg() -> str:
     path = resolve_ffmpeg()
     if path is None:
+        hint = ("Windows builds: https://www.gyan.dev/ffmpeg/builds/"
+                if sys.platform == "win32" else
+                "On Debian/Ubuntu/Raspberry Pi OS: sudo apt install ffmpeg")
         sys.exit(
             "ERROR: ffmpeg was not found on your PATH.\n"
             "Install it and make sure 'ffmpeg -version' works in a terminal first.\n"
-            "Windows builds: https://www.gyan.dev/ffmpeg/builds/"
+            f"{hint}"
         )
     return path
 

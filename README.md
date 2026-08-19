@@ -78,6 +78,62 @@ just swap the command:
 .\dist\reolink-timelapse\reolink-timelapse.exe build backyard
 ```
 
+## Raspberry Pi / Linux
+
+Works on a Raspberry Pi 4 or 5 (or any Debian/Ubuntu-based Linux), headless
+(SSH/CLI only) or with a desktop. There's no bundled-ffmpeg zip like
+Windows here — ffmpeg comes from `apt`, and "leave it running" means a
+`systemd --user` service instead of a terminal window.
+
+```bash
+git clone https://github.com/sniperdude24/reolink-timelapse.git
+cd reolink-timelapse
+./packaging/pi/install.sh          # headless: CLI only
+# or
+./packaging/pi/install.sh --desktop # also installs the Tkinter GUI's deps
+```
+
+The installer only installs packages and writes systemd unit files — it
+doesn't start anything or touch your camera config. It prints the next
+steps when it finishes:
+
+```bash
+loginctl enable-linger $USER                       # survive logout/SSH disconnect
+.venv/bin/reolink-timelapse configure backyard      # add a camera
+systemctl --user enable --now reolink-timelapse-stream.service
+systemctl --user enable --now reolink-timelapse-live@backyard.service
+```
+
+Check on it with `systemctl --user status reolink-timelapse-live@backyard.service`
+or `journalctl --user -u reolink-timelapse-live@backyard.service -f`. See
+[packaging/pi/](packaging/pi/) for the raw systemd unit templates and
+`uninstall.sh`.
+
+**Watching the live view.** Unlike Windows (loopback-only, since there's
+always a local screen), the live-view web server listens on your **LAN**
+by default here — a headless Pi has no screen of its own, so watching the
+feed means watching it from another device on your network. There is no
+password, so this is fine on a trusted home network but must **never** be
+port-forwarded or exposed to the internet. The URL is printed at startup
+by `live`, `serve-stream`, and the GUI.
+
+**Video decode load.** Every camera is decoded in software by default,
+same as Windows (see [Notes](#notes--known-limitations) for why GPU/NVDEC
+decode was rejected there). A Raspberry Pi 4 has a hardware HEVC/H.264
+decoder block that might help, or might hit a similar class of corruption
+issue on a nonconforming camera stream — nobody has measured this on real
+hardware yet, so it's an **explicit, off-by-default opt-in**, not an
+assumption: set a camera's decode mode to hardware during `configure`
+(only offered on Linux/ARM), then run
+`reolink-timelapse selftest-decode --camera <name>` first, which captures
+a short real clip, decodes it both ways, and reports how many frames
+actually differ — the same kind of A/B measurement that led to rejecting
+NVDEC on Windows. A Raspberry Pi 5 has **no** hardware video decode block
+at all and relies on software decode regardless. Either way, a camera's
+lower-res **substream** (`configure`'s "use the substream" prompt) is a
+separate, always-available lever to cut decode load if one Pi is running
+more cameras than it comfortably can.
+
 ## Install (from source)
 
 ```bash

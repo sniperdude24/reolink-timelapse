@@ -44,6 +44,8 @@ from zoneinfo import ZoneInfo
 from .capture import read_capture_stderr, stop_capture_process
 from .chunks import CHUNK_SECONDS, ChunkRenderer, refresh_output, start_chunk_capture
 from .config import Setup
+from .decode import resolve_decoder_for_source
+from .rtsp import check_ffmpeg
 
 RETRY_DELAY_SECONDS = 30
 POLL_SECONDS = 2.0
@@ -247,10 +249,13 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
             # Native resolution (scale_width=None) -- only the live view
             # downscales. The interval comes from capture_setup, so
             # length-paced recordings use this session's derived value.
+            hw_decoder = resolve_decoder_for_source(
+                setup, setup.decode_mode, check_ffmpeg(), log=log)
             renderer = ChunkRenderer(
                 chunks_dir, segments_dir,
                 interval=capture_setup.interval,
                 output_fps=setup.output_fps,
+                hw_decoder=hw_decoder,
                 log=log,
             )
             proc = start_chunk_capture(capture_setup, chunks_dir, CHUNK_SECONDS)

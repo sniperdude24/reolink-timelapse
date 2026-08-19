@@ -76,8 +76,9 @@ def start_chunk_capture(source, chunks_dir: Path,
 
 
 def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
-                  output_fps: float, scale_width: Optional[int] = None) -> Path:
-    """One raw chunk -> one sped-up mp4 segment (software decode).
+                  output_fps: float, scale_width: Optional[int] = None,
+                  hw_decoder: Optional[str] = None) -> Path:
+    """One raw chunk -> one sped-up mp4 segment.
 
     `interval` is real seconds between kept frames -- the same meaning it
     has on a Recording. `scale_width=None` keeps the source resolution;
@@ -91,14 +92,25 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     can't use it (too few keyframes to hit the target spacing) and fall
     back to spacing alone.
 
-    Decode is deliberately software-only: no -hwaccel. GPU decode (NVDEC)
-    was tried for the CPU saving, but on this camera family's
+    Decode is software by default: no -hwaccel. GPU decode (NVDEC) was
+    tried on Windows for the CPU saving, but on this camera family's
     nonconforming tiled HEVC (PPS re-sent mid-frame) NVDEC mis-stitches
     tile boundaries into a vivid-green vertical line -- decoding the same
     recorded 10-minute stream twice gave 0 line frames in software vs 401
     with NVDEC. Correct frames beat the CPU saving. NVENC *encoding* was
     also measured and rejected: encode is only ~9% of conversion cost, so
     it saves ~5% CPU while making files 4x larger.
+
+    `hw_decoder`, when given (see decode.py), forces a specific decoder --
+    currently only Raspberry Pi's V4L2 M2M hardware blocks, a different
+    decoder IP entirely from NVDEC, so the corruption finding above
+    doesn't necessarily transfer. It might, though: hardware decoders are
+    often less tolerant of nonconforming streams than software ones, and
+    nobody has run the same kind of A/B measurement against real Pi
+    hardware yet (that's what the `selftest-decode` CLI command is for).
+    Treat this as experimental until that's been done -- it stays off
+    (None) unless a Camera's decode_mode is explicitly set to "hardware"
+    and decode.py's capability probe found a matching decoder.
     """
     ffmpeg_bin = check_ffmpeg()
     os.makedirs(segments_dir, exist_ok=True)
@@ -125,6 +137,7 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     cmd = [
         ffmpeg_bin, "-y", "-loglevel", "error", "-nostats",
         "-fflags", "discardcorrupt",
+        *(["-c:v", hw_decoder] if hw_decoder else []),
         "-i", str(chunk),
         # -r is load-bearing, not redundant with setpts: without it ffmpeg
         # derives the output rate from the input stream's metadata (12.5
@@ -198,12 +211,14 @@ class ChunkRenderer:
 
     def __init__(self, chunks_dir: Path, segments_dir: Path, *, interval: float,
                  output_fps: float, scale_width: Optional[int] = None,
+                 hw_decoder: Optional[str] = None,
                  log: Callable[[str], None] = print):
         self.chunks_dir = Path(chunks_dir)
         self.segments_dir = Path(segments_dir)
         self.interval = interval
         self.output_fps = output_fps
         self.scale_width = scale_width
+        self.hw_decoder = hw_decoder
         self.log = log
         self.segments: List[Path] = []
         self.processed: set = set()
@@ -262,7 +277,8 @@ class ChunkRenderer:
                 with _RENDER_LOCK:
                     seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
                                         output_fps=self.output_fps,
-                                        scale_width=self.scale_width)
+                                        scale_width=self.scale_width,
+                                        hw_decoder=self.hw_decoder)
             except Exception as e:
                 self.failed += 1
                 self.log(f"Converting {chunk.name} failed ({e}); raw chunk kept for "

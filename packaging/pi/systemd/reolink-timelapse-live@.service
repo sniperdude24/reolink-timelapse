@@ -1,0 +1,14 @@
+[Unit]
+Description=reolink-timelapse live rolling timelapse: %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=__REPO_DIR__
+ExecStart=__VENV_BIN__/reolink-timelapse live --camera %i
+Restart=on-failure
+RestartSec=15
+
+[Install]
+WantedBy=default.target

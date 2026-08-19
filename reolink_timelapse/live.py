@@ -33,6 +33,8 @@ from typing import Callable, List, Optional
 from .capture import read_capture_stderr, stop_capture_process
 from .chunks import CHUNK_SECONDS, ChunkRenderer, refresh_output, start_chunk_capture
 from .config import Camera, app_root_dir
+from .decode import resolve_decoder_for_source
+from .rtsp import check_ffmpeg
 
 LIVE_CHUNK_SECONDS = CHUNK_SECONDS
 LIVE_SPEEDUP = 60           # 5 min of real time -> ~5s of video
@@ -94,11 +96,14 @@ def run_live(camera: Camera, stop_event: threading.Event,
     last_hour = root / "last_hour.mp4"
     session_file = root / "session.mp4"
 
+    hw_decoder = resolve_decoder_for_source(
+        camera, camera.decode_mode, check_ffmpeg(), log=lambda m: log(f"Live: {m}"))
     renderer = ChunkRenderer(
         chunks_dir, segments_dir,
         interval=speedup / LIVE_OUTPUT_FPS,  # 60x at 60fps = 1 frame per real second
         output_fps=LIVE_OUTPUT_FPS,
         scale_width=LIVE_OUTPUT_WIDTH,
+        hw_decoder=hw_decoder,
         log=lambda m: log(f"Live: {m}"),
     )
 

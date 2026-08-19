@@ -87,6 +87,7 @@ class Setup:
     port: int = 554
     channel: int = 1
     substream: bool = True
+    decode_mode: str = "software"  # "software" | "hardware" -- see decode.py
     interval: float = 30
     output_dir: str = "."
     output_fps: float = 30
@@ -104,6 +105,10 @@ class Camera:
     port: int = 554
     channel: int = 1
     substream: bool = True
+    # "software" (always safe, the default everywhere) or "hardware" --
+    # an explicit, unvalidated-by-default opt-in to platform hardware
+    # decode (currently only Raspberry Pi's V4L2 M2M). See decode.py.
+    decode_mode: str = "software"
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "Camera":
@@ -158,6 +163,7 @@ class Recording:
         return Setup(
             name=self.name, ip=camera.ip, user=camera.user, password=camera.password,
             port=camera.port, channel=camera.channel, substream=camera.substream,
+            decode_mode=camera.decode_mode,
             interval=self.interval, output_dir=self.output_dir,
             output_fps=self.output_fps, target_video_seconds=self.target_video_seconds,
             schedule=self.schedule,
@@ -172,6 +178,9 @@ class Config:
         # Cameras the Live Timelapse panel had running; any number can run
         # at once. Restored on the next launch as the panel's selection.
         self.live_cameras: list[str] = []
+        # None = platform default (loopback-only on Windows, LAN-visible
+        # on Linux -- see webstream.py). Overridable here for either.
+        self.stream_bind_host: Optional[str] = None
         self.migrated_from: Optional[Path] = None
         self.migration_error: Optional[str] = None
         self.schema_migrated = False
@@ -201,6 +210,7 @@ class Config:
         self.live_cameras = list(live.get("cameras") or [])
         if not self.live_cameras and live.get("camera_name"):
             self.live_cameras = [live["camera_name"]]
+        self.stream_bind_host = (raw.get("stream") or {}).get("bind_host")
         if self.schema_migrated:
             self.save()
 
@@ -254,6 +264,8 @@ class Config:
         }
         if self.live_cameras:
             raw["live"] = {"cameras": list(self.live_cameras)}
+        if self.stream_bind_host:
+            raw["stream"] = {"bind_host": self.stream_bind_host}
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         if sys.platform != "win32":
