@@ -92,25 +92,42 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     can't use it (too few keyframes to hit the target spacing) and fall
     back to spacing alone.
 
-    Decode is software by default: no -hwaccel. GPU decode (NVDEC) was
-    tried on Windows for the CPU saving, but on this camera family's
-    nonconforming tiled HEVC (PPS re-sent mid-frame) NVDEC mis-stitches
-    tile boundaries into a vivid-green vertical line -- decoding the same
-    recorded 10-minute stream twice gave 0 line frames in software vs 401
-    with NVDEC. Correct frames beat the CPU saving. NVENC *encoding* was
-    also measured and rejected: encode is only ~9% of conversion cost, so
-    it saves ~5% CPU while making files 4x larger.
+    Decode is software by default: no -hwaccel. GPU decode (NVDEC) on
+    Windows was rejected after real measurement, and re-confirmed against
+    *this* pipeline specifically -- not just carried forward from before
+    the JPEG-to-chunk rewrite. Original finding (2026-08-16, old
+    JPEG-capture path): on this camera family's nonconforming tiled HEVC
+    (PPS re-sent mid-frame), NVDEC mis-stitches tile boundaries into a
+    vivid-green vertical line -- decoding the same recorded 10-minute
+    stream twice gave 0 line frames in software vs 401 with NVDEC.
+    Re-test (2026-08-18, via `selftest-decode` against this exact
+    convert_chunk() pipeline, real 5-minute NVR capture): 21 of 287
+    frames differed significantly (SSIM) between software and
+    `hevc_cuvid` decode -- the corruption is real and reproducible on the
+    current pipeline, not a stale conclusion. The same re-test against
+    this camera family's H.264 stream (via NVR, `h264_cuvid`), by
+    contrast, came back clean (0 of 173 frames) on a 3-minute capture --
+    a genuinely new result the original investigation never covered,
+    suggesting the corruption is specific to this camera's nonconforming
+    HEVC encoding rather than NVDEC in general. Neither finding is a
+    reason to change the default: HEVC stays off given the reproduced
+    corruption, and one clean H.264 sample isn't enough runway to trust
+    hardware decode there either -- both remain opt-in only. NVENC
+    *encoding* was also measured and rejected: encode is only ~9% of
+    conversion cost, so it saves ~5% CPU while making files 4x larger.
 
-    `hw_decoder`, when given (see decode.py), forces a specific decoder --
-    currently only Raspberry Pi's V4L2 M2M hardware blocks, a different
-    decoder IP entirely from NVDEC, so the corruption finding above
-    doesn't necessarily transfer. It might, though: hardware decoders are
+    `hw_decoder`, when given (see decode.py), forces a specific decoder.
+    On Windows this now includes NVDEC (`h264_cuvid`/`hevc_cuvid`) per
+    the re-test above, alongside Raspberry Pi's V4L2 M2M hardware blocks
+    -- a different decoder IP entirely, so the NVDEC finding doesn't
+    necessarily transfer to it. It might, though: hardware decoders are
     often less tolerant of nonconforming streams than software ones, and
     nobody has run the same kind of A/B measurement against real Pi
-    hardware yet (that's what the `selftest-decode` CLI command is for).
-    Treat this as experimental until that's been done -- it stays off
-    (None) unless a Camera's decode_mode is explicitly set to "hardware"
-    and decode.py's capability probe found a matching decoder.
+    hardware yet (that's what the `selftest-decode` CLI command is for,
+    on either platform). Treat Pi hardware decode as experimental until
+    that's been done -- it stays off (None) unless a Camera's
+    decode_mode is explicitly set to "hardware" and decode.py's
+    capability probe found a matching decoder.
     """
     ffmpeg_bin = check_ffmpeg()
     os.makedirs(segments_dir, exist_ok=True)

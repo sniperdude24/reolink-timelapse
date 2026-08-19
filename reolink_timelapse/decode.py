@@ -1,14 +1,22 @@
 """Hardware-decode capability detection for chunk conversion.
 
-Every camera is decoded in software today (see chunks.py's convert_chunk
-docstring): GPU decode was tried on Windows and rejected after real
-measurement -- NVDEC mis-stitched this camera family's nonconforming
-tiled HEVC into visible corruption. Raspberry Pi 4 has a different
-hardware decoder block (V4L2 M2M, not NVDEC), which might avoid that
-specific failure mode or might not -- nobody has tested it on real
-hardware yet. Everything here is written to *default to software* and
-only offer hardware decode as an explicit, self-tested opt-in
-(Camera.decode_mode == "hardware"), never a silent assumption.
+Every camera is decoded in software by default (see chunks.py's
+convert_chunk docstring for the full history and numbers). GPU decode on
+Windows (NVDEC) was rejected in 2026-08-16 against the old JPEG-capture
+pipeline, then actually re-tested on 2026-08-18 against this exact
+chunk-based pipeline via `selftest-decode` on real NVR footage: the HEVC
+corruption reproduced (21/287 frames), so it stays rejected -- now
+re-confirmed, not just inherited. This camera family's H.264 stream via
+NVDEC came back clean in the same round of testing, a question the
+original investigation never asked -- still opt-in only pending more
+runway on that result. Raspberry Pi 4 has a different hardware decoder
+block (V4L2 M2M, not NVDEC), which might avoid HEVC's failure mode or
+might not -- nobody has tested it on real hardware yet. Everything here
+is written to *default to software* and only offer hardware decode as
+an explicit, self-tested opt-in (Camera.decode_mode == "hardware"),
+never a silent assumption -- true for NVDEC and V4L2 M2M alike: both are
+opt-in, and both are meant to be self-verified with `selftest-decode`
+before being trusted, regardless of which one your platform offers.
 
 Every function in this module fails closed: any probing hiccup --
 ffmpeg missing, stream unreachable, unrecognized output -- resolves to
@@ -26,24 +34,34 @@ from typing import Optional
 
 from .rtsp import build_rtsp_url, no_console_kwargs
 
-# ffmpeg decoder names for Raspberry Pi OS's V4L2 M2M hardware blocks.
-# Pi 4 has both; Pi 5 has neither (no hardware video decode block at
-# all) -- hw_decoders_available() naturally returns empty there since
-# ffmpeg won't list decoders the running kernel/driver doesn't expose.
-HW_DECODERS = {
-    "h264": "h264_v4l2m2m",
-    "hevc": "hevc_v4l2m2m",
-}
+# ffmpeg decoder names per hardware-decode family this project knows
+# about, dispatched by platform. Windows: NVDEC via ffmpeg's cuvid
+# decoders. Linux/ARM (Raspberry Pi): V4L2 M2M -- Pi 4 has both codecs'
+# blocks, Pi 5 has neither (no hardware video decode block at all), which
+# hw_decoders_available() naturally reflects since ffmpeg won't list
+# decoders the running kernel/driver doesn't expose. Anywhere else:
+# no known hardware-decode family, hardware mode always resolves to None.
+_NVDEC_DECODERS = {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}
+_PI_V4L2_DECODERS = {"h264": "h264_v4l2m2m", "hevc": "hevc_v4l2m2m"}
+
+
+def decoder_map_for_platform() -> dict:
+    """Which hardware-decoder family applies to this host, if any -- pure
+    host-capability dispatch, says nothing about whether hardware decode
+    is actually safe for a given camera's stream (that's what a decode
+    self-test is for)."""
+    if sys.platform == "win32":
+        return _NVDEC_DECODERS
+    if sys.platform == "linux" and platform.machine() in (
+        "aarch64", "armv7l", "arm64",
+    ):
+        return _PI_V4L2_DECODERS
+    return {}
 
 
 def hw_decode_platform() -> bool:
-    """Whether this machine is even the right *kind* of hardware for the
-    V4L2 M2M path -- Linux on an ARM board. Pure host-capability gating;
-    says nothing about whether hardware decode is safe for a given
-    camera's stream (that's what a decode self-test is for)."""
-    return sys.platform == "linux" and platform.machine() in (
-        "aarch64", "armv7l", "arm64",
-    )
+    """Whether this host has any known hardware-decode family at all."""
+    return bool(decoder_map_for_platform())
 
 
 def probe_codec(source, ffmpeg_bin: str, timeout: float = 8.0) -> Optional[str]:
@@ -64,9 +82,10 @@ def probe_codec(source, ffmpeg_bin: str, timeout: float = 8.0) -> Optional[str]:
 
 
 def hw_decoders_available(ffmpeg_bin: str) -> set:
-    """Which of HW_DECODERS' values this ffmpeg build actually exposes --
-    feature detection only (the decoder exists), not a correctness
-    guarantee (that it decodes *this* stream cleanly)."""
+    """Which of this platform's candidate hardware decoders the local
+    ffmpeg build actually exposes -- feature detection only (the decoder
+    exists), not a correctness guarantee (that it decodes *this* stream
+    cleanly)."""
     try:
         r = subprocess.run(
             [ffmpeg_bin, "-hide_banner", "-decoders"],
@@ -74,7 +93,7 @@ def hw_decoders_available(ffmpeg_bin: str) -> set:
         )
     except (OSError, subprocess.TimeoutExpired):
         return set()
-    return {name for name in HW_DECODERS.values() if name in r.stdout}
+    return {name for name in decoder_map_for_platform().values() if name in r.stdout}
 
 
 def resolve_decoder(codec: Optional[str], mode: str, ffmpeg_bin: str) -> Optional[str]:
@@ -82,9 +101,9 @@ def resolve_decoder(codec: Optional[str], mode: str, ffmpeg_bin: str) -> Optiona
     ("software"/"hardware"), or None to let ffmpeg pick its software
     default. Fails closed to None on any unknown codec, unsupported
     platform, or missing decoder -- never raises."""
-    if mode != "hardware" or codec is None or not hw_decode_platform():
+    if mode != "hardware" or codec is None:
         return None
-    decoder = HW_DECODERS.get(codec)
+    decoder = decoder_map_for_platform().get(codec)
     if decoder is None or decoder not in hw_decoders_available(ffmpeg_bin):
         return None
     return decoder

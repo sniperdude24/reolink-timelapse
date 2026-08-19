@@ -146,9 +146,11 @@ def cmd_configure(args: argparse.Namespace) -> None:
     decode_mode = existing.decode_mode if existing else "software"
     from .decode import hw_decode_platform
     if hw_decode_platform():
+        mechanism = "NVDEC" if sys.platform == "win32" else "V4L2 M2M"
         want_hw = _prompt_yes_no(
-            "Try hardware video decode (EXPERIMENTAL -- unvalidated on this "
-            "camera's stream; run 'selftest-decode' before trusting it)?",
+            f"Try hardware video decode ({mechanism}) for this camera? "
+            f"EXPERIMENTAL -- unvalidated on this camera's stream; run "
+            f"'selftest-decode --camera {args.name}' before trusting it",
             decode_mode == "hardware",
         )
         decode_mode = "hardware" if want_hw else "software"
@@ -339,7 +341,7 @@ def cmd_selftest_decode(args: argparse.Namespace) -> None:
 
     from .capture import stop_capture_process
     from .chunks import convert_chunk, start_chunk_capture
-    from .decode import HW_DECODERS, hw_decoders_available, probe_codec
+    from .decode import decoder_map_for_platform, hw_decoders_available, probe_codec
     from .rtsp import check_ffmpeg, no_console_kwargs
 
     ffmpeg_bin = check_ffmpeg()
@@ -352,9 +354,9 @@ def cmd_selftest_decode(args: argparse.Namespace) -> None:
         sys.exit("ERROR: couldn't determine the camera's video codec "
                  "(is the stream reachable?).")
     print(f"Codec: {codec}")
-    hw_decoder = HW_DECODERS.get(codec)
+    hw_decoder = decoder_map_for_platform().get(codec)
     if hw_decoder is None:
-        sys.exit(f"ERROR: no known hardware decoder exists for '{codec}' on this project.")
+        sys.exit(f"ERROR: no known hardware decoder exists for '{codec}' on this platform.")
     if hw_decoder not in hw_decoders_available(ffmpeg_bin):
         sys.exit(f"ERROR: this ffmpeg build doesn't expose '{hw_decoder}' -- "
                  f"hardware decode isn't available on this system.")
@@ -382,9 +384,13 @@ def cmd_selftest_decode(args: argparse.Namespace) -> None:
 
         print("Comparing frame-by-frame (SSIM)...")
         stats_file = tmp / "ssim.txt"
+        # ffmpeg's filter-graph parser treats ':' as an option separator,
+        # so a Windows drive-letter path (C:\...) breaks -lavfi option
+        # parsing even when escaped -- side-step it entirely by running
+        # ffmpeg with the temp dir as cwd and passing a bare filename.
         cmd = [ffmpeg_bin, "-i", str(sw_path), "-i", str(hw_path),
-               "-lavfi", f"ssim=stats_file={stats_file}", "-f", "null", "-"]
-        r = subprocess.run(cmd, capture_output=True, text=True, **no_console_kwargs())
+               "-lavfi", f"ssim=stats_file={stats_file.name}", "-f", "null", "-"]
+        r = subprocess.run(cmd, capture_output=True, text=True, cwd=tmp, **no_console_kwargs())
         if not stats_file.exists():
             sys.exit(f"ERROR: comparison failed:\n{(r.stderr or '')[-500:]}")
 

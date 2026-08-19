@@ -118,21 +118,22 @@ port-forwarded or exposed to the internet. The URL is printed at startup
 by `live`, `serve-stream`, and the GUI.
 
 **Video decode load.** Every camera is decoded in software by default,
-same as Windows (see [Notes](#notes--known-limitations) for why GPU/NVDEC
-decode was rejected there). A Raspberry Pi 4 has a hardware HEVC/H.264
-decoder block that might help, or might hit a similar class of corruption
-issue on a nonconforming camera stream — nobody has measured this on real
-hardware yet, so it's an **explicit, off-by-default opt-in**, not an
-assumption: set a camera's decode mode to hardware during `configure`
-(only offered on Linux/ARM), then run
+same as Windows (see [Notes](#notes--known-limitations) for the real
+NVDEC measurement behind that). A Raspberry Pi 4 has a hardware
+HEVC/H.264 decoder block that might help, or might hit a similar class of
+corruption on a nonconforming camera stream — nobody has measured this on
+real Pi hardware yet, so it's an **explicit, off-by-default opt-in**, not
+an assumption: set a camera's decode mode to hardware during `configure`
+(offered on both Linux/ARM and Windows — V4L2 M2M or NVDEC respectively,
+whichever hardware decoder this platform actually has), then run
 `reolink-timelapse selftest-decode --camera <name>` first, which captures
 a short real clip, decodes it both ways, and reports how many frames
-actually differ — the same kind of A/B measurement that led to rejecting
-NVDEC on Windows. A Raspberry Pi 5 has **no** hardware video decode block
-at all and relies on software decode regardless. Either way, a camera's
-lower-res **substream** (`configure`'s "use the substream" prompt) is a
-separate, always-available lever to cut decode load if one Pi is running
-more cameras than it comfortably can.
+actually differ — the same kind of A/B measurement that established the
+NVDEC finding on Windows in the first place. A Raspberry Pi 5 has **no**
+hardware video decode block at all and relies on software decode
+regardless. Either way, a camera's lower-res **substream** (`configure`'s
+"use the substream" prompt) is a separate, always-available lever to cut
+decode load if one Pi is running more cameras than it comfortably can.
 
 ## Install (from source)
 
@@ -414,6 +415,14 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
 - Decoding is deliberately software-only. GPU decode (NVDEC) was tried and
   rejected: on Reolink's tiled HEVC it mis-stitches tile boundaries into a
   vivid-green vertical line — decoding the same recording twice gave 0
-  damaged frames in software versus 401 with NVDEC. GPU *encoding* (NVENC)
+  damaged frames in software versus 401 with NVDEC. This was re-tested
+  directly (not just assumed) against real NVR footage on the current
+  chunk-based capture pipeline and reproduced: 21 of 287 frames differed
+  significantly between software and NVDEC decode. The same test against
+  this camera family's H.264 stream came back clean (0 of 173 frames) —
+  a new result, still not enough runway to trust hardware decode there
+  either. Both remain available as an explicit, self-tested opt-in via
+  `decode_mode` and `selftest-decode` (see [Raspberry Pi /
+  Linux](#raspberry-pi--linux)), never a default. GPU *encoding* (NVENC)
   was also measured and rejected: it saves about 5% CPU while making files
   4x larger.
