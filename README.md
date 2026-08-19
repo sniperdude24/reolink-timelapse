@@ -426,3 +426,13 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   Linux](#raspberry-pi--linux)), never a default. GPU *encoding* (NVENC)
   was also measured and rejected: it saves about 5% CPU while making files
   4x larger.
+- **Output videos are HEVC (H.265)**, switched from H.264 after
+  benchmarking all three real codec options (H.264/HEVC/AV1) across three
+  daylight captures at both the live and scheduled-recording resolution
+  profiles. HEVC consistently produced 43-73% smaller files than H.264 for
+  about the same encode time and near-identical quality (SSIM ~0.96). AV1
+  was tested too and rejected — only a marginal size win over H.264 for
+  more encode time, even though it did keep up with real-time at native
+  4K. The one real tradeoff: H.264 plays on essentially anything, while
+  HEVC's support, though broad, isn't universal on older devices or some
+  browsers.
