@@ -426,13 +426,16 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   Linux](#raspberry-pi--linux)), never a default. GPU *encoding* (NVENC)
   was also measured and rejected: it saves about 5% CPU while making files
   4x larger.
-- **Output videos are HEVC (H.265)**, switched from H.264 after
-  benchmarking all three real codec options (H.264/HEVC/AV1) across three
-  daylight captures at both the live and scheduled-recording resolution
-  profiles. HEVC consistently produced 43-73% smaller files than H.264 for
-  about the same encode time and near-identical quality (SSIM ~0.96). AV1
-  was tested too and rejected — only a marginal size win over H.264 for
-  more encode time, even though it did keep up with real-time at native
-  4K. The one real tradeoff: H.264 plays on essentially anything, while
-  HEVC's support, though broad, isn't universal on older devices or some
-  browsers.
+- **Output videos are H.264, CRF 23 (explicit)**. HEVC was tried first —
+  it won a benchmark across three daylight captures (43-73% smaller files,
+  SSIM ~0.96) and briefly shipped — but real production use surfaced a
+  defect the benchmark's SSIM check couldn't see: dark, noisy, low-light
+  regions (grass at dusk) came out visibly smoothed under HEVC's default
+  quality setting. A CRF sweep on the same real footage mapped the actual
+  tradeoff: the point where HEVC's grain came back close to matching
+  H.264's was also the point where HEVC stopped being smaller than H.264
+  — there's no setting on this kind of content where it wins on both size
+  and quality at once. Reverted to H.264 with its CRF pinned explicitly
+  rather than left as an implicit default. AV1 was tested too and
+  rejected for the same reason it always was — only a marginal size win
+  over H.264 for more encode time.

@@ -129,20 +129,29 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     decode_mode is explicitly set to "hardware" and decode.py's
     capability probe found a matching decoder.
 
-    Output encoding is software libx265 (HEVC), switched from libx264
-    (H.264) on 2026-08-19 after benchmarking H.264/HEVC/AV1 across three
-    real daylight captures -- both this profile (live: 1920px/60fps) and
-    the scheduled-recording profile (native resolution/30fps/
-    keyframe-only selection). HEVC won consistently: 43-73% of H.264's
-    file size for ~100% of its encode time, SSIM ~0.96 against the H.264
-    baseline in every run. AV1 (libsvtav1) was also tested and rejected:
-    93-96% of H.264's size (barely better) for 92-123% of its time --
-    not disqualified on speed (it kept up with real-time even at native
-    4K, ~189s to process 900s of footage), just not worth it on the
-    size/quality tradeoff. Tradeoff accepted with the switch: H.264 plays
-    on literally anything, HEVC's support is broad but not universal
-    (older devices/some browsers) -- `-tag:v hvc1` mitigates the most
-    common failure mode (QuickTime/Safari refusing untagged HEVC-in-MP4).
+    Output encoding is software libx264 (H.264), CRF 23 -- explicit, not
+    just the library default, after a real back-and-forth on 2026-08-19.
+    HEVC (libx265) was tried first: benchmarked against H.264/AV1 across
+    three real daylight captures, won consistently on paper (43-73% of
+    H.264's size for ~100% of its encode time, SSIM ~0.96 against the
+    H.264 baseline every time) and briefly shipped as the default. Real
+    production use then surfaced a real, localized defect the benchmark's
+    SSIM check never caught: dark/noisy low-light regions (grass at dusk)
+    came out visibly smoothed/waxy under HEVC's default CRF 28, because
+    HEVC's stronger prediction treats fine sensor grain as compressible
+    redundancy more aggressively than H.264 does. A controlled CRF sweep
+    on the same real source (HEVC crf 28/24/22/20/17 vs the H.264
+    baseline) found the actual shape of the tradeoff: crf 24 was the
+    *last* point where HEVC still beat H.264's size (71%), and even there
+    the grain was only partially restored; crf 22 was already 113% of
+    H.264's size, i.e. HEVC had already lost its size advantage before
+    fully regaining H.264's quality. There is no CRF on this content where
+    HEVC is simultaneously smaller than H.264 AND matches its grain
+    retention -- so the honest call was to drop HEVC and go back to
+    H.264, with the CRF now pinned explicitly (23, matching libx264's own
+    default) instead of left implicit, so this decision is legible in the
+    command line itself and doesn't silently drift if ffmpeg's own
+    default ever changes.
     """
     ffmpeg_bin = check_ffmpeg()
     os.makedirs(segments_dir, exist_ok=True)
@@ -176,10 +185,7 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
         # fps on this camera) and DROPS frames to match -- measured 11 of
         # 47 kept. setpts sets the timestamps; -r sets the output rate.
         "-an", "-vf", ",".join(stages), "-r", str(output_fps),
-        "-c:v", "libx265", "-preset", "veryfast", "-pix_fmt", "yuv420p",
-        "-tag:v", "hvc1",  # QuickTime/Safari/some Windows players need this
-        # tag to recognize HEVC-in-MP4 at all; VLC and ffmpeg-based players
-        # don't care either way.
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
         str(tmp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, **no_console_kwargs())
