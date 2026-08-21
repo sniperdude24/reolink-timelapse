@@ -13,10 +13,13 @@ chunk. On stop, both are renamed into sessions/ under dated names --
 nothing watchable is ever overwritten by the next start.
 
 Disk stays flat by design (user's choice, revised from an earlier
-keep-everything policy): each raw chunk is deleted as soon as its segment
-is built (kept only when conversion fails, for diagnosis), segments are
-kept for the whole session so its outputs could be rebuilt, and a new
-session clears the previous session's segments. Chunks left behind by
+keep-everything policy): each raw chunk is deleted once the *next* chunk
+has been converted -- the newest converted chunk is retained one cycle to
+prime deflicker across the chunk seam (see chunks.py), so peak disk is
+one extra chunk over strict delete-immediately. Chunks are kept only when
+conversion fails, for diagnosis; segments are kept for the whole session
+so its outputs could be rebuilt, and a new session clears the previous
+session's segments. Chunks left behind by
 pre-retention versions are never touched -- they're excluded from the new
 session and reported once as safe to delete.
 """

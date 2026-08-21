@@ -314,13 +314,25 @@ they queue rather than stacking and spiking the machine. Three 4K cameras
 need roughly 165 seconds of rendering per 5-minute window, so there's
 plenty of headroom.
 
+**Brightness is smoothed across chunk seams, not just within them.**
+ffmpeg's deflicker filter evens out the exposure jitter the camera
+produces as light changes (most visible at dusk and dawn) — but each
+5-minute chunk is a separate ffmpeg run, so on its own the filter would
+start cold at every chunk boundary and the seam could show a brightness
+step exactly when the light is moving fastest. To fix that, each
+conversion first decodes the last few seconds of the *previous* chunk
+purely to warm the filter up, then trims those frames back out — the
+seam frames get smoothed against real history. Costs about 2% extra
+decode per chunk.
+
 Disk stays flat no matter how long it runs: each raw chunk is **deleted
-as soon as it's been converted** and stitched into both videos (kept only
-if its conversion fails), the small 1080p segments are kept for the
-current session so its videos could be rebuilt, and starting a new
-session clears the previous session's segments. Budget roughly 30 MB per
-hour per camera of kept segments in daylight (much less at night, when
-the dark scene compresses far better), plus one transient chunk of about
+once the next chunk has been converted** (the newest converted chunk is
+held one cycle as that warm-up source; failed conversions are kept for
+diagnosis), the small 1080p segments are kept for the current session so
+its videos could be rebuilt, and starting a new session clears the
+previous session's segments. Budget roughly 30 MB per hour per camera of
+kept segments in daylight (much less at night, when the dark scene
+compresses far better), plus a transient chunk or two of about
 1.8 GB/hour that never accumulates.
 
 ## Sessions, folders, and videos

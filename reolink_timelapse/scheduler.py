@@ -281,8 +281,9 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
             stop_capture_process(proc)
             proc = None
             # The final chunk is still partial; include it now that ffmpeg
-            # has exited and nothing more will be appended to it.
-            renderer.process(None, include_newest=True)
+            # has exited and nothing more will be appended to it. final=True
+            # also releases the chunk retained as the deflicker primer.
+            renderer.process(None, include_newest=True, final=True)
             session_end = _now(setup)
             _finalize_session(setup, renderer, session_start, session_end, log)
             renderer = None
@@ -295,7 +296,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
         if proc is not None:
             stop_capture_process(proc)
         if renderer is not None:
-            renderer.process(None, include_newest=True)
+            renderer.process(None, include_newest=True, final=True)
             _finalize_session(setup, renderer, session_start, _now(setup), log)
 
     log(f"Scheduler for '{setup.name}' stopped.")

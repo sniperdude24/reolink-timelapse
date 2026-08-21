@@ -36,6 +36,17 @@ from .rtsp import build_rtsp_url, check_ffmpeg, no_console_kwargs
 CHUNK_SECONDS = 300
 KEYFRAME_SNAP_MIN_INTERVAL = 5  # seconds; at/above this, keep keyframes only
 
+# ffmpeg's deflicker filter averages brightness over a sliding window of
+# this many frames (its own default). Each chunk is a separate ffmpeg run,
+# so without help the window starts empty at every chunk boundary and the
+# first frames of each segment get no smoothing against the previous
+# chunk's brightness -- visible as a step at chunk seams while the light is
+# changing fast (dusk/dawn). The fix: prime the window by decoding the
+# tail of the *previous* chunk first (enough footage to fill the window),
+# then trim those warm-up frames back out of the output. See
+# convert_chunk's primer parameter.
+DEFLICKER_SIZE = 5
+
 # Rendering is the only expensive step, and it arrives in bursts: ~55s at
 # ~1.7 cores (peak 3.5) for each 5-minute 4K chunk. Capturing is nearly
 # free, so N cameras cost ~N x 0.31 cores on average -- but if their chunks
@@ -77,12 +88,34 @@ def start_chunk_capture(source, chunks_dir: Path,
 
 def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
                   output_fps: float, scale_width: Optional[int] = None,
-                  hw_decoder: Optional[str] = None) -> Path:
+                  hw_decoder: Optional[str] = None,
+                  primer: Optional[Path] = None) -> Path:
     """One raw chunk -> one sped-up mp4 segment.
 
     `interval` is real seconds between kept frames -- the same meaning it
     has on a Recording. `scale_width=None` keeps the source resolution;
     the live view passes 1920 to downscale to 1080p.
+
+    `primer`, when given, is the *previous* chunk: its last few seconds
+    are decoded ahead of this chunk (concat filter) purely to fill
+    deflicker's sliding window with real history before the first frames
+    of this chunk arrive, then trimmed back out of the output. Without it
+    deflicker starts cold at every chunk boundary and the seam can show a
+    brightness step while the light is changing fast (dusk/dawn) -- the
+    "smooths within a chunk, not across chunk boundaries" limit noted
+    below. Priming costs ~(DEFLICKER_SIZE+1) x interval seconds of extra
+    decode per chunk (~2% at live settings) and is only applied for
+    spacing-selected intervals (below KEYFRAME_SNAP_MIN_INTERVAL):
+    keyframe-snapped intervals would need window x interval seconds of
+    warm-up -- up to half a chunk of extra decode for a 30s interval --
+    for seams that are far less visible at 10 frames per chunk. A side
+    benefit measured during verification: frame *spacing* is also
+    continuous across the seam, where the unprimed path restarts the
+    select clock at every chunk and could double-select near boundaries.
+    The trim boundary is placed half an interval before the chunk start,
+    inside the guaranteed selection gap; worst-case timing alignment can
+    leak one near-duplicate boundary frame per chunk, which is no worse
+    than the unprimed path's own seam behaviour.
 
     Intervals of KEYFRAME_SNAP_MIN_INTERVAL or more keep only keyframes.
     A lost slice corrupts every following frame until the next keyframe
@@ -158,6 +191,9 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     out = Path(segments_dir) / f"{chunk.stem}_tl.mp4"
     tmp = Path(segments_dir) / f"{chunk.stem}_tl.tmp.mp4"
 
+    use_primer = (primer is not None and Path(primer).exists()
+                  and interval < KEYFRAME_SNAP_MIN_INTERVAL)
+
     # \, -- comma is a filter-graph separator and must be escaped inside
     # the select expression.
     spacing = f"isnan(prev_selected_t)+gte(t-prev_selected_t\\,{interval})"
@@ -169,22 +205,44 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     # visible across dawn/dusk, when the camera is changing exposure (and
     # halving its frame rate) between one kept frame and the next. It runs
     # after select so it only sees frames that survive into the video.
-    # Known limit: it smooths within a chunk, not across chunk boundaries.
+    # With a primer it also smooths across the chunk boundary; without one
+    # it can only smooth within the chunk.
     stages.append("deflicker")
+    if use_primer:
+        # Drop the warm-up frames now that deflicker has consumed them.
+        # The boundary sits half an interval before this chunk's first
+        # frame -- inside the gap the select spacing guarantees between
+        # the last primer frame and the first kept frame of this chunk.
+        primer_seconds = (DEFLICKER_SIZE + 1) * interval
+        stages.append(f"trim=start={primer_seconds - interval / 2}")
     if scale_width:
         stages.append(f"scale={scale_width}:-2")
     stages.append(f"setpts=N/({output_fps}*TB)")
 
+    decode_flags = ["-fflags", "discardcorrupt",
+                    *(["-c:v", hw_decoder] if hw_decoder else [])]
+    if use_primer:
+        inputs = [
+            # -sseof: decode only the primer's tail, from the nearest
+            # keyframe -- a few seconds of extra decode, not a whole chunk.
+            *decode_flags, "-sseof", f"-{primer_seconds}", "-i", str(primer),
+            *decode_flags, "-i", str(chunk),
+        ]
+        graph = ["-filter_complex",
+                 "[0:v][1:v]concat=n=2:v=1:a=0," + ",".join(stages) + "[out]",
+                 "-map", "[out]"]
+    else:
+        inputs = [*decode_flags, "-i", str(chunk)]
+        graph = ["-vf", ",".join(stages)]
+
     cmd = [
         ffmpeg_bin, "-y", "-loglevel", "error", "-nostats",
-        "-fflags", "discardcorrupt",
-        *(["-c:v", hw_decoder] if hw_decoder else []),
-        "-i", str(chunk),
+        *inputs,
         # -r is load-bearing, not redundant with setpts: without it ffmpeg
         # derives the output rate from the input stream's metadata (12.5
         # fps on this camera) and DROPS frames to match -- measured 11 of
         # 47 kept. setpts sets the timestamps; -r sets the output rate.
-        "-an", "-vf", ",".join(stages), "-r", str(output_fps),
+        "-an", *graph, "-r", str(output_fps),
         "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
         str(tmp),
     ]
@@ -264,6 +322,13 @@ class ChunkRenderer:
         self.segments: List[Path] = []
         self.processed: set = set()
         self.failed = 0
+        # The most recent chunk, retained one extra cycle to prime the next
+        # conversion's deflicker window (see convert_chunk). _pending_delete
+        # is the successfully converted chunk awaiting deletion once its
+        # successor has used it -- failed chunks are never queued here, so
+        # the keep-for-diagnosis guarantee is untouched.
+        self._primer: Optional[Path] = None
+        self._pending_delete: Optional[Path] = None
 
     def exclude_existing(self) -> List[Path]:
         """Mark chunks already on disk as handled and return them.
@@ -316,29 +381,62 @@ class ChunkRenderer:
             try:
                 # Serialised across every camera -- see _RENDER_LOCK.
                 with _RENDER_LOCK:
-                    seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
-                                        output_fps=self.output_fps,
-                                        scale_width=self.scale_width,
-                                        hw_decoder=self.hw_decoder)
+                    try:
+                        seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
+                                            output_fps=self.output_fps,
+                                            scale_width=self.scale_width,
+                                            hw_decoder=self.hw_decoder,
+                                            primer=self._primer)
+                    except Exception:
+                        if self._primer is None:
+                            raise
+                        # A damaged primer must never take the next chunk
+                        # down with it -- retry cold, exactly as before
+                        # priming existed.
+                        self.log(f"Converting {chunk.name} with deflicker primer "
+                                 f"failed; retrying without it.")
+                        seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
+                                            output_fps=self.output_fps,
+                                            scale_width=self.scale_width,
+                                            hw_decoder=self.hw_decoder,
+                                            primer=None)
             except Exception as e:
                 self.failed += 1
+                self._primer = chunk  # still real adjacent footage for the next seam
                 self.log(f"Converting {chunk.name} failed ({e}); raw chunk kept for "
                          f"diagnosis ({self.failed} kept so far this session).")
                 continue
             self.segments.append(seg)
             made += 1
-            # Delete as soon as the segment exists: the segment is the
-            # durable artifact and any outputs are derived from it.
-            # (Deleting after the refresh instead meant a locked output
-            # file -- e.g. one open in a video player -- orphaned the raw
-            # chunk permanently. Seen in the wild: 2.6 GB in one session.)
-            try:
-                os.remove(chunk)
-            except OSError as e:
-                self.log(f"Couldn't delete converted chunk {chunk.name}: {e}")
+            # The converted chunk is retained one cycle as the next chunk's
+            # deflicker primer, then deleted -- deletion is deferred, never
+            # gated on an output refresh. (Gating it on the refresh once
+            # orphaned a chunk permanently whenever an output file was
+            # locked by a video player. Seen in the wild: 2.6 GB in one
+            # session.) Peak disk is one extra chunk over the old
+            # delete-immediately behaviour.
+            if self._pending_delete is not None:
+                try:
+                    os.remove(self._pending_delete)
+                except OSError as e:
+                    self.log(f"Couldn't delete converted chunk "
+                             f"{self._pending_delete.name}: {e}")
+            self._primer = chunk
+            self._pending_delete = chunk
             if on_segment is not None:
                 try:
                     on_segment(self, final)
                 except Exception as e:
                     self.log(f"Updating outputs failed: {e}")
+        if final and self._pending_delete is not None:
+            # Session over -- nothing left to prime, so the last retained
+            # chunk can go too. Without this it would linger and be
+            # reported as leftover at the next start.
+            try:
+                os.remove(self._pending_delete)
+            except OSError as e:
+                self.log(f"Couldn't delete converted chunk "
+                         f"{self._pending_delete.name}: {e}")
+            self._pending_delete = None
+            self._primer = None
         return made
