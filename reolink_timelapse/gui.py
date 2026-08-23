@@ -581,6 +581,10 @@ class App:
         if not name or name not in self.running:
             messagebox.showinfo("Stop Capture", "That recording isn't running.")
             return
+        if not messagebox.askyesno(
+                "Stop Capture",
+                f"Stop recording '{name}'? The session's video will be built now."):
+            return
         self.log(f"Stopping '{name}'...")
         # run_scheduled() itself builds a video from this session's frames
         # once it actually finishes stopping -- watch the log for it.
@@ -666,6 +670,11 @@ class App:
             return
         if not self._live_running(name):
             messagebox.showinfo("Live Timelapse", f"'{name}' isn't running.")
+            return
+        if not messagebox.askyesno(
+                "Live Timelapse",
+                f"Stop the live timelapse for '{name}'? The session and "
+                f"last-hour videos will be archived."):
             return
         self.log(f"Stopping live timelapse for '{name}' (finishing the current chunk)...")
         self.live_workers[name].stop_event.set()
@@ -779,12 +788,17 @@ class App:
     def on_close(self) -> None:
         if self._closing:
             return
+        running_names = list(self.running.keys())
+        running_names += [name for name, rc in self.live_workers.items()
+                          if rc.thread.is_alive()]
         workers = list(self.running.values())
         workers += [rc for name, rc in self.live_workers.items()
                     if rc.thread.is_alive()]
         if workers:
             if not messagebox.askyesno(
-                "Quit", f"{len(workers)} capture(s) still running. Stop them and quit?"
+                "Quit",
+                f"Still capturing: {', '.join(running_names)}.\n\n"
+                f"Stop and archive everything, then quit?"
             ):
                 return
             self._closing = True
@@ -858,6 +872,24 @@ class CameraDialog(tk.Toplevel):
                          variable=self.stream_var, value="main").pack(anchor="w")
         add_row("Stream", stream_frame)
 
+        # Per-camera encode quality: labeled presets, stored as the bare
+        # int. 23 is libx264's default and what everything used before
+        # this was configurable.
+        crf_options = [
+            "20 - higher quality, larger files",
+            "23 - default",
+            "26 - smaller files, softer",
+            "28 - smallest, softest in low light",
+        ]
+        current_crf = existing.crf if existing else 23
+        self.crf_var = tk.StringVar(
+            value=next((o for o in crf_options if o.startswith(str(current_crf))),
+                       crf_options[1])
+        )
+        crf_combo = ttk.Combobox(self, textvariable=self.crf_var,
+                                 values=crf_options, state="readonly", width=32)
+        add_row("Encode quality (CRF)", crf_combo)
+
         btn_frame = ttk.Frame(self)
         btn_frame.grid(row=self._row, column=0, columnspan=2, pady=8)
         ttk.Button(btn_frame, text="Save", command=self._save).pack(side="left", padx=4)
@@ -896,6 +928,11 @@ class CameraDialog(tk.Toplevel):
         camera = Camera(
             name=name, ip=ip, port=port, user=user, password=password,
             channel=channel, substream=(self.stream_var.get() == "sub"),
+            # decode_mode has no widget here (it's a CLI-configured,
+            # self-tested opt-in) -- carry the existing value through so
+            # editing a camera doesn't silently reset it to software.
+            decode_mode=self.existing.decode_mode if self.existing else "software",
+            crf=int(self.crf_var.get().split(" ")[0]),
         )
         self.config.put_camera(camera)
         self.config.save()

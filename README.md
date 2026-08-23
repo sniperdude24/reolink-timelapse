@@ -330,10 +330,14 @@ once the next chunk has been converted** (the newest converted chunk is
 held one cycle as that warm-up source; failed conversions are kept for
 diagnosis), the small 1080p segments are kept for the current session so
 its videos could be rebuilt, and starting a new session clears the
-previous session's segments. Budget roughly 30 MB per hour per camera of
-kept segments in daylight (much less at night, when the dark scene
-compresses far better), plus a transient chunk or two of about
-1.8 GB/hour that never accumulates.
+previous session's segments. If the program dies suddenly (crash, End
+Task, power loss), any raw chunks it left behind are **cleaned up
+automatically at the camera's next start** — the watchable footage was
+already preserved as `*_recovered.mp4`, so the leftovers are pure dead
+weight and the log reports how much space came back. Budget roughly
+30 MB per hour per camera of kept segments in daylight (much less at
+night, when the dark scene compresses far better), plus a transient
+chunk or two of about 1.8 GB/hour that never accumulates.
 
 ## Sessions, folders, and videos
 
@@ -450,4 +454,7 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   and quality at once. Reverted to H.264 with its CRF pinned explicitly
   rather than left as an implicit default. AV1 was tested too and
   rejected for the same reason it always was — only a marginal size win
-  over H.264 for more encode time.
+  over H.264 for more encode time. The CRF is configurable **per camera**
+  (Edit Camera in the GUI, or `configure` in the CLI): 20 for higher
+  quality at larger sizes, 23 (the tested default), or 26/28 to trade
+  softness for smaller files.

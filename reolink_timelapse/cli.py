@@ -143,6 +143,12 @@ def cmd_configure(args: argparse.Namespace) -> None:
         existing.substream if existing else True,
     )
 
+    crf = int(_prompt_choice(
+        "Encode quality CRF (lower = better quality, larger files)",
+        ["20", "23", "26", "28"],
+        str(existing.crf if existing else 23),
+    ))
+
     decode_mode = existing.decode_mode if existing else "software"
     from .decode import hw_decode_platform
     if hw_decode_platform():
@@ -157,7 +163,7 @@ def cmd_configure(args: argparse.Namespace) -> None:
 
     camera = Camera(
         name=args.name, ip=ip, port=port, user=user, password=password,
-        channel=channel, substream=substream, decode_mode=decode_mode,
+        channel=channel, substream=substream, decode_mode=decode_mode, crf=crf,
     )
     config.put_camera(camera)
     config.save()

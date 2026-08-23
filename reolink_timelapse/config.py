@@ -88,6 +88,7 @@ class Setup:
     channel: int = 1
     substream: bool = True
     decode_mode: str = "software"  # "software" | "hardware" -- see decode.py
+    crf: int = 23  # per-camera H.264 encode quality -- see Camera.crf
     interval: float = 30
     output_dir: str = "."
     output_fps: float = 30
@@ -109,6 +110,12 @@ class Camera:
     # an explicit, unvalidated-by-default opt-in to platform hardware
     # decode (currently only Raspberry Pi's V4L2 M2M). See decode.py.
     decode_mode: str = "software"
+    # H.264 encode quality for this camera's rendered output (lower =
+    # better quality, larger files). 23 matches libx264's own default and
+    # is what every release before per-camera CRF shipped implicitly; the
+    # GUI/CLI offer 20/23/26/28. See convert_chunk's docstring in
+    # chunks.py for the measured history behind the codec+CRF choice.
+    crf: int = 23
 
     @classmethod
     def from_dict(cls, name: str, data: dict) -> "Camera":
@@ -163,7 +170,7 @@ class Recording:
         return Setup(
             name=self.name, ip=camera.ip, user=camera.user, password=camera.password,
             port=camera.port, channel=camera.channel, substream=camera.substream,
-            decode_mode=camera.decode_mode,
+            decode_mode=camera.decode_mode, crf=camera.crf,
             interval=self.interval, output_dir=self.output_dir,
             output_fps=self.output_fps, target_video_seconds=self.target_video_seconds,
             schedule=self.schedule,

@@ -89,7 +89,8 @@ def start_chunk_capture(source, chunks_dir: Path,
 def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
                   output_fps: float, scale_width: Optional[int] = None,
                   hw_decoder: Optional[str] = None,
-                  primer: Optional[Path] = None) -> Path:
+                  primer: Optional[Path] = None,
+                  crf: int = 23) -> Path:
     """One raw chunk -> one sped-up mp4 segment.
 
     `interval` is real seconds between kept frames -- the same meaning it
@@ -184,7 +185,9 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     H.264, with the CRF now pinned explicitly (23, matching libx264's own
     default) instead of left implicit, so this decision is legible in the
     command line itself and doesn't silently drift if ffmpeg's own
-    default ever changes.
+    default ever changes. The `crf` parameter makes it per-camera
+    (Camera.crf, default 23; GUI/CLI offer 20/23/26/28) -- lower is
+    better quality and larger files.
     """
     ffmpeg_bin = check_ffmpeg()
     os.makedirs(segments_dir, exist_ok=True)
@@ -243,7 +246,7 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
         # fps on this camera) and DROPS frames to match -- measured 11 of
         # 47 kept. setpts sets the timestamps; -r sets the output rate.
         "-an", *graph, "-r", str(output_fps),
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", str(crf), "-pix_fmt", "yuv420p",
         str(tmp),
     ]
     r = subprocess.run(cmd, capture_output=True, text=True, **no_console_kwargs())
@@ -310,7 +313,7 @@ class ChunkRenderer:
 
     def __init__(self, chunks_dir: Path, segments_dir: Path, *, interval: float,
                  output_fps: float, scale_width: Optional[int] = None,
-                 hw_decoder: Optional[str] = None,
+                 hw_decoder: Optional[str] = None, crf: int = 23,
                  log: Callable[[str], None] = print):
         self.chunks_dir = Path(chunks_dir)
         self.segments_dir = Path(segments_dir)
@@ -318,6 +321,7 @@ class ChunkRenderer:
         self.output_fps = output_fps
         self.scale_width = scale_width
         self.hw_decoder = hw_decoder
+        self.crf = crf
         self.log = log
         self.segments: List[Path] = []
         self.processed: set = set()
@@ -334,8 +338,10 @@ class ChunkRenderer:
         """Mark chunks already on disk as handled and return them.
 
         A session means "since Start". Chunks left by an earlier run sort
-        first by name and would otherwise prepend old footage. They are the
-        user's to delete, so report them but never touch them.
+        first by name and would otherwise prepend old footage. The engine
+        itself never touches them -- they're returned for the caller to
+        report or clean up (the live view deletes them as crash leftovers;
+        see run_live).
         """
         leftover = sorted(self.chunks_dir.glob("*.ts"))
         self.processed.update(c.name for c in leftover)
@@ -386,7 +392,7 @@ class ChunkRenderer:
                                             output_fps=self.output_fps,
                                             scale_width=self.scale_width,
                                             hw_decoder=self.hw_decoder,
-                                            primer=self._primer)
+                                            primer=self._primer, crf=self.crf)
                     except Exception:
                         if self._primer is None:
                             raise
@@ -399,7 +405,7 @@ class ChunkRenderer:
                                             output_fps=self.output_fps,
                                             scale_width=self.scale_width,
                                             hw_decoder=self.hw_decoder,
-                                            primer=None)
+                                            primer=None, crf=self.crf)
             except Exception as e:
                 self.failed += 1
                 self._primer = chunk  # still real adjacent footage for the next seam

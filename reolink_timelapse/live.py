@@ -17,11 +17,14 @@ keep-everything policy): each raw chunk is deleted once the *next* chunk
 has been converted -- the newest converted chunk is retained one cycle to
 prime deflicker across the chunk seam (see chunks.py), so peak disk is
 one extra chunk over strict delete-immediately. Chunks are kept only when
-conversion fails, for diagnosis; segments are kept for the whole session
-so its outputs could be rebuilt, and a new session clears the previous
-session's segments. Chunks left behind by
-pre-retention versions are never touched -- they're excluded from the new
-session and reported once as safe to delete.
+conversion fails, for diagnosis (within the session -- see below);
+segments are kept for the whole session so its outputs could be rebuilt,
+and a new session clears the previous session's segments. Chunks left
+behind by a sudden shutdown (crash, kill, power loss) are dead weight --
+whatever was watchable is preserved separately as *_recovered.mp4 -- so a
+new session deletes them automatically and logs how much space came
+back. That sweep also collects kept-for-diagnosis chunks from earlier
+runs; they survive for inspection only until the camera's next start.
 """
 
 from __future__ import annotations
@@ -107,14 +110,29 @@ def run_live(camera: Camera, stop_event: threading.Event,
         output_fps=LIVE_OUTPUT_FPS,
         scale_width=LIVE_OUTPUT_WIDTH,
         hw_decoder=hw_decoder,
+        crf=camera.crf,
         log=lambda m: log(f"Live: {m}"),
     )
 
+    # Raw chunks already here are dead weight from a run that didn't stop
+    # cleanly (a clean stop deletes every chunk it converted): their
+    # footage isn't part of this session and, if the crash net fired,
+    # whatever was watchable was already preserved as *_recovered.mp4
+    # below. Delete them instead of just reporting them -- a chunk that
+    # won't delete is still excluded from the session (exclude_existing
+    # marked it processed), so cleanup failure can't corrupt anything.
     leftover = renderer.exclude_existing()
     if leftover:
-        leftover_gb = sum(c.stat().st_size for c in leftover) / 1e9
-        log(f"Live: {len(leftover)} raw chunk(s) from earlier runs in {chunks_dir} "
-            f"({leftover_gb:.1f} GB) -- not part of this session, safe to delete.")
+        freed = 0
+        for stale_chunk in leftover:
+            try:
+                size = stale_chunk.stat().st_size
+                os.remove(stale_chunk)
+                freed += size
+            except OSError as e:
+                log(f"Live: couldn't delete leftover chunk {stale_chunk.name}: {e}")
+        log(f"Live: cleaned up {len(leftover)} leftover raw chunk(s) from an "
+            f"earlier run ({freed / 1e6:.0f} MB reclaimed).")
     renderer.clear_stale(root)
 
     # An output still sitting here means the last run never archived it

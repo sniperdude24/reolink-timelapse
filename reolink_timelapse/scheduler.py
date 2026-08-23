@@ -256,6 +256,7 @@ def run_scheduled(setup: Setup, log=print, stop_event: Optional[threading.Event]
                 interval=capture_setup.interval,
                 output_fps=setup.output_fps,
                 hw_decoder=hw_decoder,
+                crf=setup.crf,
                 log=log,
             )
             proc = start_chunk_capture(capture_setup, chunks_dir, CHUNK_SECONDS)
