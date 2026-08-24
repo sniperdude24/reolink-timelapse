@@ -281,6 +281,21 @@ closes off the partial session the same way, and also renames the final
 program dies without a clean stop, whatever it left behind is preserved as
 `*_recovered.mp4` on the next start.
 
+**Optional retention cap.** By default archived session videos are kept
+forever. To auto-delete them after a number of days, set
+`sessions_keep_days` under the `live:` key in `config.yaml`:
+
+```yaml
+live:
+  cameras: [Backyard]
+  sessions_keep_days: 7
+```
+
+Pruning runs at each live start and at every 6-hour rotation, and only
+touches that camera's `sessions\` archive — never the live outputs, and
+never scheduled recordings' videos. It's always an explicit opt-in;
+nothing is deleted unless you set the key.
+
 ### Watch live in VLC (self-updating)
 
 The **Watch in VLC** button opens the selected camera's last hour in VLC

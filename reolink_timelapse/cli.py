@@ -287,7 +287,9 @@ def cmd_live(args: argparse.Namespace) -> None:
     start_stream_server(host=config.stream_bind_host, log=print)
     print(f"Watch live at: {stream_url(camera.name)}")
     stop_event = threading.Event()
-    worker = threading.Thread(target=run_live, args=(camera, stop_event), daemon=True)
+    worker = threading.Thread(
+        target=run_live, args=(camera, stop_event),
+        kwargs={"sessions_keep_days": config.live_sessions_keep_days}, daemon=True)
     worker.start()
     print("Live timelapse running -- press Ctrl+C to stop.")
     try:

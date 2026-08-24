@@ -658,7 +658,8 @@ class App:
 
     def _live_worker_fn(self, name, camera, stop_event, status_cb) -> None:
         try:
-            run_live(camera, stop_event, log=self.log, status=status_cb)
+            run_live(camera, stop_event, log=self.log, status=status_cb,
+                     sessions_keep_days=self.config.live_sessions_keep_days)
         except SystemExit as e:
             self.log(f"Live timelapse for '{name}' stopped: {e}")
         except Exception as e:

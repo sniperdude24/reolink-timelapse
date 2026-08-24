@@ -32,6 +32,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Callable, List, Optional
@@ -79,13 +80,38 @@ def _block_filename(camera_name: str, segments: List[Path], suffix: str = "") ->
             f"{start:%Hh%M}-{end:%Hh%M}{suffix}.mp4")
 
 
+def _prune_sessions(sessions_dir: Path, keep_days: Optional[int],
+                    log: Callable[[str], None]) -> None:
+    """Delete archived sessions/ videos older than keep_days. None (the
+    default) keeps everything -- retention is an explicit opt-in (see
+    Config.live_sessions_keep_days). Runs at session start and at each
+    block rotation, so a weekly horizon never drifts far."""
+    if not keep_days or not sessions_dir.is_dir():
+        return
+    cutoff = time.time() - keep_days * 86400
+    removed, freed = 0, 0
+    for video in sessions_dir.glob("*.mp4"):
+        try:
+            st = video.stat()
+            if st.st_mtime < cutoff:
+                os.remove(video)
+                removed += 1
+                freed += st.st_size
+        except OSError as e:
+            log(f"Live: couldn't prune {video.name}: {e}")
+    if removed:
+        log(f"Live: pruned {removed} archived session video(s) older than "
+            f"{keep_days} day(s) ({freed / 1e6:.0f} MB reclaimed).")
+
+
 def run_live(camera: Camera, stop_event: threading.Event,
              log: Callable[[str], None] = print,
              status: Optional[Callable[[int, float], None]] = None,
              chunk_seconds: int = LIVE_CHUNK_SECONDS,
              speedup: float = LIVE_SPEEDUP,
              window_chunks: int = LIVE_WINDOW_CHUNKS,
-             block_chunks: int = SESSION_BLOCK_CHUNKS) -> None:
+             block_chunks: int = SESSION_BLOCK_CHUNKS,
+             sessions_keep_days: Optional[int] = None) -> None:
     """Capture + render loop; runs until stop_event is set.
 
     Maintains `last_hour.mp4` (a rolling window) and `session.mp4` (the
@@ -151,6 +177,8 @@ def run_live(camera: Camera, stop_event: threading.Event,
         except OSError as e:
             log(f"Live: couldn't preserve the previous {orphan.name}: {e}")
 
+    _prune_sessions(sessions_dir, sessions_keep_days, log)
+
     # last_hour.mp4 must keep spanning a rotation boundary, so the newest
     # segments are tracked separately from the block they belong to. They
     # stay on disk after their block closes, but are deliberately NOT
@@ -188,6 +216,7 @@ def run_live(camera: Camera, stop_event: threading.Event,
             return
         renderer.segments = []
         prune_segments()
+        _prune_sessions(sessions_dir, sessions_keep_days, log)
 
     def archive_last_hour() -> None:
         """On stop, keep the final window view too: the next start's first

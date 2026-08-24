@@ -188,6 +188,11 @@ class Config:
         # None = platform default (loopback-only on Windows, LAN-visible
         # on Linux -- see webstream.py). Overridable here for either.
         self.stream_bind_host: Optional[str] = None
+        # Auto-delete archived live sessions/ videos older than this many
+        # days. None (the shipped default) = keep forever -- silently
+        # deleting people's archives would be a nasty surprise, so
+        # retention is always an explicit opt-in.
+        self.live_sessions_keep_days: Optional[int] = None
         self.migrated_from: Optional[Path] = None
         self.migration_error: Optional[str] = None
         self.schema_migrated = False
@@ -217,6 +222,8 @@ class Config:
         self.live_cameras = list(live.get("cameras") or [])
         if not self.live_cameras and live.get("camera_name"):
             self.live_cameras = [live["camera_name"]]
+        keep = live.get("sessions_keep_days")
+        self.live_sessions_keep_days = int(keep) if keep else None
         self.stream_bind_host = (raw.get("stream") or {}).get("bind_host")
         if self.schema_migrated:
             self.save()
@@ -269,8 +276,13 @@ class Config:
             "cameras": {name: c.to_dict() for name, c in self.cameras.items()},
             "recordings": {name: r.to_dict() for name, r in self.recordings.items()},
         }
+        live: dict = {}
         if self.live_cameras:
-            raw["live"] = {"cameras": list(self.live_cameras)}
+            live["cameras"] = list(self.live_cameras)
+        if self.live_sessions_keep_days:
+            live["sessions_keep_days"] = self.live_sessions_keep_days
+        if live:
+            raw["live"] = live
         if self.stream_bind_host:
             raw["stream"] = {"bind_host": self.stream_bind_host}
         with open(self.path, "w", encoding="utf-8") as f:
