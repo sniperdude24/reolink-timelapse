@@ -394,18 +394,32 @@ class ChunkRenderer:
                                             hw_decoder=self.hw_decoder,
                                             primer=self._primer, crf=self.crf)
                     except Exception:
-                        if self._primer is None:
+                        if self._primer is None and self.hw_decoder is None:
                             raise
-                        # A damaged primer must never take the next chunk
-                        # down with it -- retry cold, exactly as before
-                        # priming existed.
-                        self.log(f"Converting {chunk.name} with deflicker primer "
-                                 f"failed; retrying without it.")
+                        # Neither optional input may take a chunk down with
+                        # it: a damaged primer must not cascade, and a
+                        # hardware decoder that fails at runtime must not
+                        # fail the session (real case: a Pi 5's ffmpeg
+                        # lists h264/hevc_v4l2m2m but the board has no
+                        # decode block, so the decoder can't open). Retry
+                        # with plain software decode and no primer.
+                        dropped = [n for n, v in (("deflicker primer", self._primer),
+                                                  (f"hardware decoder '{self.hw_decoder}'",
+                                                   self.hw_decoder)) if v is not None]
+                        self.log(f"Converting {chunk.name} failed; retrying without "
+                                 f"{' or '.join(dropped)}.")
                         seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
                                             output_fps=self.output_fps,
                                             scale_width=self.scale_width,
-                                            hw_decoder=self.hw_decoder,
+                                            hw_decoder=None,
                                             primer=None, crf=self.crf)
+                        if self.hw_decoder is not None:
+                            # The retry succeeded without it -- don't pay a
+                            # failed attempt on every future chunk.
+                            self.log(f"Hardware decoder '{self.hw_decoder}' doesn't "
+                                     f"work here; using software decode for the rest "
+                                     f"of this session.")
+                            self.hw_decoder = None
             except Exception as e:
                 self.failed += 1
                 self._primer = chunk  # still real adjacent footage for the next seam

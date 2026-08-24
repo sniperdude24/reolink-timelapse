@@ -37,10 +37,15 @@ from .rtsp import build_rtsp_url, no_console_kwargs
 # ffmpeg decoder names per hardware-decode family this project knows
 # about, dispatched by platform. Windows: NVDEC via ffmpeg's cuvid
 # decoders. Linux/ARM (Raspberry Pi): V4L2 M2M -- Pi 4 has both codecs'
-# blocks, Pi 5 has neither (no hardware video decode block at all), which
-# hw_decoders_available() naturally reflects since ffmpeg won't list
-# decoders the running kernel/driver doesn't expose. Anywhere else:
-# no known hardware-decode family, hardware mode always resolves to None.
+# blocks, Pi 5 has neither (no hardware video decode block at all).
+# IMPORTANT, learned on real Pi 5 hardware (2026-08-22): ffmpeg lists a
+# compiled-in v4l2m2m decoder even when no decode device exists, so
+# hw_decoders_available() CANNOT tell a Pi 4 from a Pi 5 -- on a Pi 5 the
+# decoder passes feature detection, then fails at open time with "Could
+# not find a valid device". Runtime failure is handled where it happens:
+# selftest-decode reports it as its verdict, and ChunkRenderer retries in
+# software and latches hardware off for the session. Anywhere else: no
+# known hardware-decode family, hardware mode always resolves to None.
 _NVDEC_DECODERS = {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}
 _PI_V4L2_DECODERS = {"h264": "h264_v4l2m2m", "hevc": "hevc_v4l2m2m"}
 

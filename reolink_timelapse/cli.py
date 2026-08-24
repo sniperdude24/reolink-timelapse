@@ -385,8 +385,22 @@ def cmd_selftest_decode(args: argparse.Namespace) -> None:
         os.replace(convert_chunk(chunk, segments_dir, interval=1.0, output_fps=10), sw_path)
         print(f"Decoding with '{hw_decoder}'...")
         hw_path = segments_dir / "hw.mp4"
-        os.replace(convert_chunk(chunk, segments_dir, interval=1.0, output_fps=10,
-                                 hw_decoder=hw_decoder), hw_path)
+        try:
+            os.replace(convert_chunk(chunk, segments_dir, interval=1.0, output_fps=10,
+                                     hw_decoder=hw_decoder), hw_path)
+        except RuntimeError as e:
+            # ffmpeg listing a decoder doesn't prove the hardware behind it
+            # exists: a Pi 5 build still lists h264/hevc_v4l2m2m but has no
+            # video decode block, so opening the decoder fails at runtime
+            # ("Could not find a valid device"). That IS the self-test's
+            # answer, not a crash.
+            sys.exit(
+                f"\nVERDICT: '{hw_decoder}' exists in this ffmpeg build but "
+                f"FAILED to run on this hardware:\n  {e}\n"
+                f"This machine cannot hardware-decode {codec} (a Raspberry "
+                f"Pi 5, for example, has no video decode block at all). "
+                f"Software decode -- the default -- is the correct setting; "
+                f"leave decode_mode alone.")
 
         print("Comparing frame-by-frame (SSIM)...")
         stats_file = tmp / "ssim.txt"
