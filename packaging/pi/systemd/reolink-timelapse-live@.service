@@ -4,6 +4,9 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# Without this, Python block-buffers stdout under systemd (no tty) and
+# the app's log lines never reach the journal in any useful timeframe.
+Environment=PYTHONUNBUFFERED=1
 Type=simple
 WorkingDirectory=__REPO_DIR__
 ExecStart=__VENV_BIN__/reolink-timelapse live --camera %i
