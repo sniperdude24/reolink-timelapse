@@ -129,9 +129,17 @@ whichever hardware decoder this platform actually has), then run
 `reolink-timelapse selftest-decode --camera <name>` first, which captures
 a short real clip, decodes it both ways, and reports how many frames
 actually differ — the same kind of A/B measurement that established the
-NVDEC finding on Windows in the first place. A Raspberry Pi 5 has **no**
-hardware video decode block at all and relies on software decode
-regardless. Either way, a camera's lower-res **substream** (`configure`'s
+NVDEC finding on Windows in the first place. A Raspberry Pi 5 dropped
+the Pi 4's general decode blocks (no hardware H.264 decode at all, and
+no hardware encode on any Pi model — encoding is always software), but
+it has a dedicated **HEVC-only decode block ("rpivid")** that the app
+uses via ffmpeg's `-hwaccel drm` when decode mode is hardware. On real
+hardware this measured **3.2x-realtime decode at ~6.5x less CPU** than
+software on a 4K HEVC camera — the difference between a Pi 5 converting
+nearly nonstop (hot, fan on) and idling most of each cycle. The same
+rule applies: run `selftest-decode` first — fast is not the same as
+correct, which is exactly how NVDEC failed. Either way, a camera's
+lower-res **substream** (`configure`'s
 "use the substream" prompt) is a separate, always-available lever to cut
 decode load if one Pi is running more cameras than it comfortably can.
 
@@ -478,7 +486,10 @@ gitignored, but worth knowing if that repo checkout isn't otherwise private.
   a new result, still not enough runway to trust hardware decode there
   either. Both remain available as an explicit, self-tested opt-in via
   `decode_mode` and `selftest-decode` (see [Raspberry Pi /
-  Linux](#raspberry-pi--linux)), never a default. GPU *encoding* (NVENC)
+  Linux](#raspberry-pi--linux)), never a default. The Raspberry Pi 5's
+  HEVC-only "rpivid" block (used via `-hwaccel drm`) is the one hardware
+  path measured to be worth it there — ~6.5x less decode CPU on real 4K
+  footage — under the same self-test-first rule. GPU *encoding* (NVENC)
   was also measured and rejected: it saves about 5% CPU while making files
   4x larger.
 - **Output videos are H.264, CRF 23 (explicit)**. HEVC was tried first —

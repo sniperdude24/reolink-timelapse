@@ -34,24 +34,56 @@ from typing import Optional
 
 from .rtsp import build_rtsp_url, no_console_kwargs
 
-# ffmpeg decoder names per hardware-decode family this project knows
-# about, dispatched by platform. Windows: NVDEC via ffmpeg's cuvid
-# decoders. Linux/ARM (Raspberry Pi): V4L2 M2M -- Pi 4 has both codecs'
-# blocks, Pi 5 has neither (no hardware video decode block at all).
-# IMPORTANT, learned on real Pi 5 hardware (2026-08-22): ffmpeg lists a
-# compiled-in v4l2m2m decoder even when no decode device exists, so
-# hw_decoders_available() CANNOT tell a Pi 4 from a Pi 5 -- on a Pi 5 the
-# decoder passes feature detection, then fails at open time with "Could
-# not find a valid device". Runtime failure is handled where it happens:
-# selftest-decode reports it as its verdict, and ChunkRenderer retries in
-# software and latches hardware off for the session. Anywhere else: no
-# known hardware-decode family, hardware mode always resolves to None.
+# ffmpeg decode-selection specs per hardware-decode family this project
+# knows about, dispatched by platform + device probing. A spec is either
+# a plain ffmpeg decoder name (emitted as `-c:v <name>`) or
+# "hwaccel:<method>" (emitted as `-hwaccel <method>`, keeping ffmpeg's
+# normal decoder but accelerating it).
+#
+# Windows: NVDEC via ffmpeg's cuvid decoders. Raspberry Pi 4: general
+# V4L2 M2M blocks for both codecs. Raspberry Pi 5: the Pi 4's M2M blocks
+# are GONE (hevc/h264_v4l2m2m pass feature detection because they're
+# compiled in, then fail at open with "Could not find a valid device" --
+# learned on real hardware 2026-08-22), and there is no hardware encoder
+# and no H.264 decode of any kind -- but it DOES have a dedicated
+# HEVC-only decode block, "rpivid" (/dev/video19, driver rpi-hevc-dec),
+# exposed through the V4L2 *stateless request* API. Raspberry Pi OS's
+# patched ffmpeg (--enable-v4l2-request --enable-sand) drives it via
+# `-hwaccel drm`. Measured on the real Pi 5 against a real production 4K
+# chunk (2026-08-24): software decode 43.1s CPU / 33.3s wall per 30s of
+# footage vs 6.6s CPU / 9.3s wall with -hwaccel drm -- 3.24x realtime,
+# ~6.5x less CPU, all frames decoded. Speed is not correctness, though:
+# NVDEC also ran fine while corrupting 401 frames of this camera
+# family's nonconforming HEVC stream, so rpivid gets the same treatment
+# as every hardware path -- opt-in only, validated per-camera with
+# `selftest-decode` before being trusted.
+#
+# Runtime failure of any spec is handled where it happens: selftest-
+# decode reports it as its verdict, and ChunkRenderer retries in
+# software and latches hardware off for the session. (For "hwaccel:"
+# specs that latch rarely fires -- -hwaccel is advisory, so ffmpeg
+# falls back to software decode by itself instead of erroring.)
 _NVDEC_DECODERS = {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}
 _PI_V4L2_DECODERS = {"h264": "h264_v4l2m2m", "hevc": "hevc_v4l2m2m"}
+_PI5_RPIVID = {"hevc": "hwaccel:drm"}
+
+
+def _pi5_rpivid_present() -> bool:
+    """Whether this host exposes the Pi 5's rpivid HEVC decode block
+    (V4L2 device named rpi-hevc-dec). Device probing, no ffmpeg needed;
+    fails closed on any filesystem hiccup."""
+    try:
+        from pathlib import Path
+        for name_file in Path("/sys/class/video4linux").glob("*/name"):
+            if "rpi-hevc-dec" in name_file.read_text(errors="ignore"):
+                return True
+    except OSError:
+        pass
+    return False
 
 
 def decoder_map_for_platform() -> dict:
-    """Which hardware-decoder family applies to this host, if any -- pure
+    """Which hardware-decode family applies to this host, if any -- pure
     host-capability dispatch, says nothing about whether hardware decode
     is actually safe for a given camera's stream (that's what a decode
     self-test is for)."""
@@ -60,6 +92,10 @@ def decoder_map_for_platform() -> dict:
     if sys.platform == "linux" and platform.machine() in (
         "aarch64", "armv7l", "arm64",
     ):
+        # Pi 5: rpivid handles HEVC only; nothing exists for H.264.
+        # Anything else ARM/Linux falls back to the Pi 4 M2M family.
+        if _pi5_rpivid_present():
+            return _PI5_RPIVID
         return _PI_V4L2_DECODERS
     return {}
 
@@ -87,18 +123,32 @@ def probe_codec(source, ffmpeg_bin: str, timeout: float = 8.0) -> Optional[str]:
 
 
 def hw_decoders_available(ffmpeg_bin: str) -> set:
-    """Which of this platform's candidate hardware decoders the local
+    """Which of this platform's candidate hardware-decode specs the local
     ffmpeg build actually exposes -- feature detection only (the decoder
-    exists), not a correctness guarantee (that it decodes *this* stream
-    cleanly)."""
-    try:
-        r = subprocess.run(
-            [ffmpeg_bin, "-hide_banner", "-decoders"],
-            capture_output=True, text=True, timeout=10, **no_console_kwargs(),
-        )
-    except (OSError, subprocess.TimeoutExpired):
+    or hwaccel method exists), not a correctness guarantee (that it
+    decodes *this* stream cleanly). Plain decoder names are checked
+    against `-decoders`; "hwaccel:<method>" specs against `-hwaccels`."""
+    specs = set(decoder_map_for_platform().values())
+    if not specs:
         return set()
-    return {name for name in decoder_map_for_platform().values() if name in r.stdout}
+    available = set()
+    listings = {}  # ffmpeg flag -> its output, fetched at most once each
+    for spec in specs:
+        flag = "-hwaccels" if spec.startswith("hwaccel:") else "-decoders"
+        if flag not in listings:
+            try:
+                r = subprocess.run(
+                    [ffmpeg_bin, "-hide_banner", flag],
+                    capture_output=True, text=True, timeout=10,
+                    **no_console_kwargs(),
+                )
+                listings[flag] = r.stdout
+            except (OSError, subprocess.TimeoutExpired):
+                listings[flag] = ""
+        needle = spec.split(":", 1)[1] if spec.startswith("hwaccel:") else spec
+        if needle in listings[flag].split():
+            available.add(spec)
+    return available
 
 
 def resolve_decoder(codec: Optional[str], mode: str, ffmpeg_bin: str) -> Optional[str]:

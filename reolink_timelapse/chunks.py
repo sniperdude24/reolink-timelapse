@@ -150,18 +150,20 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     *encoding* was also measured and rejected: encode is only ~9% of
     conversion cost, so it saves ~5% CPU while making files 4x larger.
 
-    `hw_decoder`, when given (see decode.py), forces a specific decoder.
-    On Windows this now includes NVDEC (`h264_cuvid`/`hevc_cuvid`) per
-    the re-test above, alongside Raspberry Pi's V4L2 M2M hardware blocks
-    -- a different decoder IP entirely, so the NVDEC finding doesn't
-    necessarily transfer to it. It might, though: hardware decoders are
-    often less tolerant of nonconforming streams than software ones, and
-    nobody has run the same kind of A/B measurement against real Pi
-    hardware yet (that's what the `selftest-decode` CLI command is for,
-    on either platform). Treat Pi hardware decode as experimental until
-    that's been done -- it stays off (None) unless a Camera's
-    decode_mode is explicitly set to "hardware" and decode.py's
-    capability probe found a matching decoder.
+    `hw_decoder`, when given (see decode.py), selects hardware decode:
+    either a decoder name emitted as `-c:v` (Windows NVDEC cuvid, Pi 4
+    V4L2 M2M) or a "hwaccel:<method>" spec emitted as `-hwaccel`
+    ("hwaccel:drm" = the Pi 5's HEVC-only rpivid block via the V4L2
+    stateless request API). rpivid was measured on the real Pi 5 against
+    a real production 4K chunk (2026-08-24): 3.24x-realtime decode at
+    ~6.5x less CPU than software (6.6s vs 43.1s CPU per 30s of footage)
+    -- transformative on a board that otherwise spends ~97% of its time
+    converting. But speed is not correctness: NVDEC also ran fine while
+    corrupting this camera family's nonconforming HEVC stream, and
+    hardware decoders in general are less tolerant of stream quirks
+    than software ones, so every hardware path -- cuvid, v4l2m2m, and
+    rpivid alike -- is opt-in only (Camera.decode_mode == "hardware")
+    and meant to be validated per-camera with `selftest-decode` first.
 
     Output encoding is software libx264 (H.264), CRF 23 -- explicit, not
     just the library default, after a real back-and-forth on 2026-08-19.
@@ -222,8 +224,18 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
         stages.append(f"scale={scale_width}:-2")
     stages.append(f"setpts=N/({output_fps}*TB)")
 
-    decode_flags = ["-fflags", "discardcorrupt",
-                    *(["-c:v", hw_decoder] if hw_decoder else [])]
+    # hw_decoder is either a plain decoder name ("hevc_cuvid",
+    # "hevc_v4l2m2m") emitted as -c:v, or a "hwaccel:<method>" spec
+    # ("hwaccel:drm" = Pi 5 rpivid) emitted as -hwaccel -- see decode.py.
+    # -hwaccel is advisory: if it can't engage, ffmpeg quietly decodes in
+    # software instead of erroring.
+    if hw_decoder and hw_decoder.startswith("hwaccel:"):
+        decoder_flags = ["-hwaccel", hw_decoder.split(":", 1)[1]]
+    elif hw_decoder:
+        decoder_flags = ["-c:v", hw_decoder]
+    else:
+        decoder_flags = []
+    decode_flags = ["-fflags", "discardcorrupt", *decoder_flags]
     if use_primer:
         inputs = [
             # -sseof: decode only the primer's tail, from the nearest
