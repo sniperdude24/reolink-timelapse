@@ -25,25 +25,31 @@ screen of its own, so watching the feed means watching it from another
 device on the network). Either can be overridden via Config's
 stream_bind_host.
 
-Authentication is an opt-in username + PIN login (Config's
-stream_auth_user/stream_auth_pin; off by default so existing installs
-keep working). When enabled, every page and video requires either a
-logged-in session cookie (the login form, for browsers) or HTTP Basic
-credentials (for VLC: http://user:pin@host:8177/...). Brute force is
-blunted with a global lockout: 5 straight failures locks the login for
-30s, doubling per further failure up to 15 minutes. Requests from the
-same machine (loopback) skip auth -- EXCEPT when they carry Cloudflare
-headers, because a Cloudflare Tunnel's cloudflared runs on this same
-host and hands remote internet traffic to us *from* loopback; those
-requests must authenticate like any other remote visitor. A PIN gate
-still isn't a reason to port-forward this -- remote access belongs
-behind an HTTPS tunnel (see README) so the PIN isn't sent in the clear.
+Authentication is an opt-in multi-user login. Accounts live in
+webusers.py's store (stream_users.yaml, salted PBKDF2 hashes -- never
+plaintext) and are managed from the web UI itself: admins get a /users
+page to add users, reset PINs, and remove people (which logs their
+devices out immediately), no config editing involved. With no accounts
+anywhere the server stays open -- the original trusted-LAN posture --
+and the legacy single-account config keys (stream.auth_user/auth_pin)
+are imported once as the first admin. When enabled, every page and
+video requires either a logged-in session cookie (the login form, for
+browsers) or HTTP Basic credentials (for VLC:
+http://user:pin@host:8177/...). Brute force is blunted with a global
+lockout: 5 straight failures locks the login for 30s, doubling per
+further failure up to 15 minutes. Requests from the same machine
+(loopback) skip auth and count as an admin (also the recovery path if
+every PIN is forgotten) -- EXCEPT when they carry Cloudflare headers,
+because a Cloudflare Tunnel's cloudflared runs on this same host and
+hands remote internet traffic to us *from* loopback; those requests
+must authenticate like any other remote visitor. A login still isn't a
+reason to port-forward this -- remote access belongs behind an HTTPS
+tunnel (see README) so credentials aren't sent in the clear.
 """
 
 from __future__ import annotations
 
 import datetime as dt
-import hmac
 import html
 import re
 import secrets
@@ -70,11 +76,17 @@ _server: Optional[ThreadingHTTPServer] = None
 _server_lock = threading.Lock()
 _bind_host: str = "127.0.0.1"  # updated by start_stream_server to whatever it actually bound
 
-_auth: Optional[Tuple[str, str]] = None  # (username, pin) or None = no login
+_store = None            # webusers.UserStore once auth is configured
 _auth_lock = threading.Lock()
-_sessions: dict = {}     # cookie token -> expiry timestamp
+_sessions: dict = {}     # cookie token -> (username, expiry timestamp)
 _fail_streak: int = 0
 _locked_until: float = 0.0
+
+_LOCAL_USER = "__local__"  # pseudo-identity for the host machine itself
+
+
+def _auth_enabled() -> bool:
+    return _store is not None and len(_store) > 0
 
 
 def default_bind_host() -> str:
@@ -126,14 +138,19 @@ def _page(title: str, body_html: str) -> bytes:
     ).encode("utf-8")
 
 
-def _root_index() -> bytes:
+def _root_index(identity: Tuple[str, bool]) -> bytes:
     cameras = sorted((d.name for d in _live_root().iterdir() if d.is_dir())
                      if _live_root().is_dir() else [])
     items = "".join(
         f"<li><a href='/live/{quote(c)}/'>{html.escape(c)}</a></li>" for c in cameras
     ) or "<li class='m'>(no cameras have live folders yet)</li>"
-    logout = ("<p class='m'><a href='/logout'>log out</a></p>" if _auth else "")
-    return _page("Reolink Timelapse", f"<h2>Cameras</h2><ul>{items}</ul>{logout}")
+    footer = ""
+    if identity[1]:
+        footer += "<p class='m'><a href='/users'>manage users</a></p>"
+    if _auth_enabled() and identity[0] not in ("", _LOCAL_USER):
+        footer += (f"<p class='m'>logged in as {html.escape(identity[0])} &middot; "
+                   f"<a href='/logout'>log out</a></p>")
+    return _page("Reolink Timelapse", f"<h2>Cameras</h2><ul>{items}</ul>{footer}")
 
 
 def _camera_index(camera: str) -> Optional[bytes]:
@@ -173,50 +190,56 @@ def _camera_index(camera: str) -> Optional[bytes]:
     )
 
 
-def _check_credentials(user: str, pin: str) -> Tuple[bool, float]:
-    """(ok, locked_for_seconds). Wrong credentials feed the global
-    lockout; a correct login clears it. Comparisons are constant-time so
-    response timing leaks nothing about how close a guess was."""
+def _check_credentials(user: str, pin: str) -> Tuple[Optional[str], float]:
+    """(matched_username_or_None, locked_for_seconds). Wrong credentials
+    feed the global lockout; a correct login clears it. The user store's
+    comparisons are constant-time (and hash-cost-constant even for
+    unknown usernames) so response timing leaks nothing."""
     global _fail_streak, _locked_until
-    if _auth is None:
-        return True, 0.0
+    if not _auth_enabled():
+        return "", 0.0
     with _auth_lock:
         now = time.time()
         if now < _locked_until:
-            return False, _locked_until - now
-        # Username is case-insensitive -- phone keyboards autocapitalize,
-        # and "Sniperdude" failing against "sniperdude" is a support trap,
-        # not security. The PIN is compared exactly.
-        ok = (hmac.compare_digest(user.casefold().encode(), _auth[0].casefold().encode())
-              & hmac.compare_digest(pin.encode(), _auth[1].encode()))
-        if ok:
+            return None, _locked_until - now
+    rec = _store.verify(user, pin)  # slow hash: deliberately outside the lock
+    with _auth_lock:
+        if rec is not None:
             _fail_streak = 0
         else:
             _fail_streak += 1
             if _fail_streak >= _LOCKOUT_AFTER:
-                _locked_until = now + min(
+                _locked_until = time.time() + min(
                     _LOCKOUT_BASE * 2 ** (_fail_streak - _LOCKOUT_AFTER), _LOCKOUT_MAX)
-        return bool(ok), 0.0
+    return (rec["name"] if rec else None), 0.0
 
 
-def _new_session() -> str:
+def _new_session(username: str) -> str:
     token = secrets.token_urlsafe(32)
     with _auth_lock:
         now = time.time()
-        for tok in [t for t, exp in _sessions.items() if exp < now]:
+        for tok in [t for t, (_, exp) in _sessions.items() if exp < now]:
             del _sessions[tok]
-        _sessions[token] = now + _SESSION_SECONDS
+        _sessions[token] = (username, now + _SESSION_SECONDS)
     return token
 
 
-def _session_valid(token: str) -> bool:
+def _session_user(token: str) -> Optional[str]:
     with _auth_lock:
-        exp = _sessions.get(token)
-        if exp is None or exp < time.time():
+        entry = _sessions.get(token)
+        if entry is None or entry[1] < time.time():
             _sessions.pop(token, None)
-            return False
-        _sessions[token] = time.time() + _SESSION_SECONDS  # sliding expiry
-        return True
+            return None
+        _sessions[token] = (entry[0], time.time() + _SESSION_SECONDS)  # sliding
+        return entry[0]
+
+
+def _drop_user_sessions(username: str) -> None:
+    """A removed user's logged-in devices stop working immediately."""
+    with _auth_lock:
+        for tok in [t for t, (u, _) in _sessions.items()
+                    if u.casefold() == username.casefold()]:
+            del _sessions[tok]
 
 
 def _safe_next(target: str) -> str:
@@ -235,7 +258,7 @@ def _login_page(next_path: str, error: str = "") -> bytes:
         f"<input name='username' autocomplete='username' autofocus "
         f"style='font-size:1.2em;padding:.3em'></label></p>"
         f"<p><label>PIN<br>"
-        f"<input name='pin' type='password' inputmode='numeric' pattern='[0-9]*' "
+        f"<input name='pin' type='password' "
         f"autocomplete='current-password' style='font-size:1.2em;padding:.3em'></label></p>"
         f"<p><button style='font-size:1.1em;padding:.4em 1.5em'>Log in</button></p>"
         f"</form>",
@@ -362,20 +385,26 @@ class _Handler(BaseHTTPRequestHandler):
                 return value
         return ""
 
-    def _authorized(self) -> bool:
-        if _auth is None:
-            return True
-        # Same-machine tools (the GUI's Watch-in-VLC on Windows binds
-        # loopback-only) skip the login -- but only when the request
-        # didn't come through a Cloudflare Tunnel, whose cloudflared
-        # daemon runs on this host and delivers *internet* traffic from
-        # loopback. Tunnel requests always carry CF-Connecting-IP; a LAN
-        # client faking that header only makes itself stricter.
+    def _identity(self) -> Optional[Tuple[str, bool]]:
+        """(username, is_admin) for this request, or None = must log in.
+
+        Same-machine tools (the GUI's Watch-in-VLC on Windows binds
+        loopback-only) skip the login and count as an admin -- that's
+        also the recovery path if every PIN is forgotten. But only when
+        the request didn't come through a Cloudflare Tunnel, whose
+        cloudflared daemon runs on this host and delivers *internet*
+        traffic from loopback: tunnel requests always carry
+        CF-Connecting-IP, and a LAN client faking that header only makes
+        itself stricter.
+        """
         if (self.client_address[0] in ("127.0.0.1", "::1")
                 and "CF-Connecting-IP" not in self.headers):
-            return True
-        if _session_valid(self._cookie_token()):
-            return True
+            return (_LOCAL_USER, True)
+        if not _auth_enabled():
+            return ("", False)  # open mode: anyone may view, nobody manages
+        user = _session_user(self._cookie_token())
+        if user is not None:
+            return (user, _store.is_admin(user))
         auth_header = self.headers.get("Authorization") or ""
         if auth_header.startswith("Basic "):
             try:
@@ -383,10 +412,11 @@ class _Handler(BaseHTTPRequestHandler):
                 user, _, pin = base64.b64decode(
                     auth_header[6:].strip()).decode("utf-8").partition(":")
             except Exception:
-                return False
-            ok, _ = _check_credentials(user, pin)
-            return ok
-        return False
+                return None
+            matched, _ = _check_credentials(user, pin)
+            if matched is not None:
+                return (matched, _store.is_admin(matched))
+        return None
 
     def _send_login(self, head_only: bool, error: str = "", status: int = 401) -> None:
         page = _login_page(self.path, error)
@@ -403,17 +433,20 @@ class _Handler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(page)
 
-    def _handle_login_post(self) -> None:
+    def _read_form(self) -> dict:
         try:
             length = min(int(self.headers.get("Content-Length") or 0), 4096)
-            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+            return parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
         except (ValueError, OSError):
-            form = {}
+            return {}
+
+    def _handle_login_post(self) -> None:
+        form = self._read_form()
         user = (form.get("username") or [""])[0]
         pin = (form.get("pin") or [""])[0]
         next_path = _safe_next((form.get("next") or ["/"])[0])
-        ok, locked_for = _check_credentials(user, pin)
-        if not ok:
+        matched, locked_for = _check_credentials(user, pin)
+        if matched is None:
             error = (f"Too many wrong attempts -- locked for {int(locked_for) + 1}s."
                      if locked_for else "Wrong username or PIN.")
             self._send_login(head_only=False, error=error,
@@ -423,10 +456,64 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Location", next_path)
         self.send_header(
             "Set-Cookie",
-            f"rt_session={_new_session()}; Path=/; Max-Age={_SESSION_SECONDS}; "
+            f"rt_session={_new_session(matched)}; Path=/; Max-Age={_SESSION_SECONDS}; "
             f"HttpOnly; SameSite=Lax")
         self.send_header("Content-Length", "0")
         self.end_headers()
+
+    def _handle_users(self, identity: Tuple[str, bool], head_only: bool,
+                      message: str = "", error: str = "") -> None:
+        """The admin's user-management page. Mutations arrive as POSTs
+        (cross-site POSTs can't ride the SameSite=Lax cookie, which is
+        the CSRF defence)."""
+        if not identity[1]:
+            self.send_error(403, "Only an admin can manage users")
+            return
+        rows = "".join(
+            f"<li><b>{html.escape(u['name'])}</b>"
+            + (" <span class='m'>(admin)</span>" if u["admin"] else "")
+            + f"<form method='post' action='/users/remove' style='display:inline'>"
+              f"<input type='hidden' name='username' value='{html.escape(u['name'], quote=True)}'>"
+              f" <button>remove</button></form></li>"
+            for u in (_store.list_users() if _store else [])
+        ) or "<li class='m'>(no users yet -- everyone can view until one is added)</li>"
+        note = (f"<p style='color:#070'>{html.escape(message)}</p>" if message else "") + \
+               (f"<p style='color:#b00'>{html.escape(error)}</p>" if error else "")
+        page = _page(
+            "Users",
+            f"<p><a href='/'>&larr; cameras</a></p><h2>Users</h2>{note}"
+            f"<ul>{rows}</ul>"
+            f"<h3>Add user (or reset a PIN)</h3>"
+            f"<form method='post' action='/users/add'>"
+            f"<p><label>Username<br><input name='username' style='font-size:1.1em;padding:.3em'></label></p>"
+            f"<p><label>PIN (4+ characters; longer or wordier = safer)<br>"
+            f"<input name='pin' type='password' style='font-size:1.1em;padding:.3em'></label></p>"
+            f"<p><label><input type='checkbox' name='admin' value='1'> can manage users</label></p>"
+            f"<p><button style='font-size:1.05em;padding:.35em 1.2em'>Save</button></p></form>"
+            f"<p class='m'>Saving an existing username resets that person's PIN. "
+            f"Removing a user logs their devices out immediately.</p>",
+        )
+        self._send_html(page, head_only)
+
+    def _handle_users_post(self, identity: Tuple[str, bool], action: str) -> None:
+        if not identity[1]:
+            self.send_error(403, "Only an admin can manage users")
+            return
+        form = self._read_form()
+        username = (form.get("username") or [""])[0].strip()
+        try:
+            if action == "add":
+                _store.put(username, (form.get("pin") or [""])[0],
+                           admin=bool(form.get("admin")))
+                msg = f"Saved '{username}'."
+            else:
+                _store.remove(username)
+                _drop_user_sessions(username)
+                msg = f"Removed '{username}'."
+        except ValueError as e:
+            self._handle_users(identity, head_only=False, error=str(e))
+            return
+        self._handle_users(identity, head_only=False, message=msg)
 
     def _handle_logout(self) -> None:
         with _auth_lock:
@@ -447,11 +534,14 @@ class _Handler(BaseHTTPRequestHandler):
             if parts == ["logout"]:
                 self._handle_logout()
                 return
-            if not self._authorized():
+            identity = self._identity()
+            if identity is None:
                 self._send_login(head_only)
                 return
             if not parts:
-                self._send_html(_root_index(), head_only)
+                self._send_html(_root_index(identity), head_only)
+            elif parts == ["users"]:
+                self._handle_users(identity, head_only)
             elif len(parts) == 2 and parts[0] == "live":
                 self._send_html(_camera_index(parts[1]), head_only)
             elif len(parts) == 3 and parts[0] == "live" and parts[2] in _ALLOWED_FILES:
@@ -473,10 +563,18 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
-            if self.path.split("?", 1)[0] == "/login":
+            path = self.path.split("?", 1)[0]
+            if path == "/login":
                 self._handle_login_post()
-            else:
-                self.send_error(404)
+                return
+            if path in ("/users/add", "/users/remove"):
+                identity = self._identity()
+                if identity is None:
+                    self._send_login(head_only=False)
+                else:
+                    self._handle_users_post(identity, path.rsplit("/", 1)[1])
+                return
+            self.send_error(404)
         except (ConnectionError, OSError):
             pass
 
@@ -488,16 +586,23 @@ def start_stream_server(host: Optional[str] = None, log: Callable[[str], None] =
 
     `host` overrides the platform default (see default_bind_host()) --
     pass a Config's stream_bind_host, or leave it as None to use the
-    default. `auth` is (username, pin) to require a login on every page
-    and video (see module docstring), or None for the open default.
-    If the serving thread ever dies, that is logged and the dead server
-    is forgotten, so the next call here brings it back -- the Watch in
-    VLC button calls this before every launch for exactly that reason.
+    default. Accounts live in the stream_users.yaml store (managed from
+    the web UI's /users page); `auth` is the legacy single (username,
+    pin) config pair, imported once as the first admin account when no
+    users file exists yet. With no users anywhere the server stays open,
+    the original trusted-LAN posture. If the serving thread ever dies,
+    that is logged and the dead server is forgotten, so the next call
+    here brings it back -- the Watch in VLC button calls this before
+    every launch for exactly that reason.
     """
-    global _server, _bind_host, _auth
+    global _server, _bind_host, _store
     with _server_lock:
-        if auth and auth[0] and auth[1]:
-            _auth = (str(auth[0]), str(auth[1]))
+        if _store is None:
+            from .webusers import UserStore
+            store = UserStore()
+            if auth and auth[0] and auth[1]:
+                store.seed_if_empty(str(auth[0]), str(auth[1]))
+            _store = store
         if _server is not None:
             return
         host = host or default_bind_host()
@@ -509,7 +614,7 @@ def start_stream_server(host: Optional[str] = None, log: Callable[[str], None] =
         server.daemon_threads = True
         _bind_host = host
         if host not in ("127.0.0.1", "localhost"):
-            if _auth:
+            if _auth_enabled():
                 log(f"Live stream server listening on {host}:{STREAM_PORT} -- "
                     f"username + PIN login required.")
             else:

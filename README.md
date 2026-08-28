@@ -329,29 +329,37 @@ the server binds to localhost only; on Linux/Raspberry Pi it's
 LAN-visible by default, which is what makes a headless Pi a household
 timelapse host.
 
-### Username + PIN login
+### Users and login
 
 The server is open by default (a trusted-LAN posture, and what existing
-installs expect). To require a login on every page and video, set both
-keys under `stream:` in `config.yaml`:
+installs expect). To require a login on every page and video, create
+the first account — after that, everything is managed **from the web
+page itself**, no config editing:
 
-```yaml
-stream:
-  auth_user: yourname
-  auth_pin: "0424"   # quote it -- an unquoted leading zero is octal in YAML
-```
+- On the server's own machine, open `http://localhost:8177/users` (the
+  host machine always has access — it's also the recovery path if every
+  PIN is forgotten) and add the first user with **can manage users**
+  checked.
+- From then on, any admin sees a **manage users** link on the cameras
+  page: add a user, tick whether they can manage users, remove someone
+  (their logged-in devices stop working immediately), or reset a PIN by
+  saving the same username again. You can't remove the last admin.
 
-The username is case-insensitive (phone keyboards autocapitalize); the
-PIN must match exactly. Browsers get a login form (sessions last ~30
-days per device); VLC and other players authenticate with the URL form
-`http://yourname:0424@<host>:8177/live/<camera>/last_hour.mp4`. Brute
-force is blunted with a lockout — 5 straight failures locks the login
-for 30 seconds, doubling each failure up to 15 minutes — which makes
-guessing even a 4-digit PIN take months, not minutes. Requests from the
-server's own machine skip the login (that's how the GUI's Watch-in-VLC
-button keeps working), **except** traffic delivered by a Cloudflare
-Tunnel running on the same host — that's remote traffic and always
-needs the login.
+Accounts are stored as salted PBKDF2 hashes in `stream_users.yaml` —
+never plaintext. PINs are any secret of 4+ characters; longer or
+wordier is safer. Usernames are case-insensitive (phone keyboards
+autocapitalize); PINs must match exactly. Browsers get a login form
+(sessions last ~30 days per device); VLC and other players authenticate
+with the URL form
+`http://name:pin@<host>:8177/live/<camera>/last_hour.mp4`. Brute force
+is blunted with a lockout — 5 straight failures locks the login for 30
+seconds, doubling each failure up to 15 minutes — which makes guessing
+even a 4-digit PIN take months, not minutes. Requests from the server's
+own machine skip the login (that's how the GUI's Watch-in-VLC button
+keeps working), **except** traffic delivered by a Cloudflare Tunnel
+running on the same host — that's remote traffic and always needs the
+login. (The older single-account `stream.auth_user`/`auth_pin` config
+keys still work: they're imported once as the first admin.)
 
 ### Remote access (from outside your network)
 
