@@ -269,6 +269,17 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *args) -> None:
         pass  # VLC re-requests every loop pass; per-request logging is noise
 
+    def send_response(self, code: int, message: Optional[str] = None) -> None:
+        """Every response is uncacheable. Found the hard way (2026-08-28):
+        Cloudflare's edge caches .mp4 by default when the origin says
+        nothing, which (a) served video to requests that never passed the
+        login -- a removed user kept watching from cache -- and (b) served
+        up to 4-hour-stale "last hour" video to remote viewers. Auth'd
+        dynamic content must say no-store itself; never rely on the CDN's
+        defaults being conservative."""
+        super().send_response(code, message)
+        self.send_header("Cache-Control", "no-store")
+
     def _load(self, camera: str, filename: str) -> Optional[bytes]:
         """Read a live output whole (see module docstring for why whole).
 
