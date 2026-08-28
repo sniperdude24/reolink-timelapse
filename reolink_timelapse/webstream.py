@@ -447,6 +447,23 @@ class _Handler(BaseHTTPRequestHandler):
             if parts == ["logout"]:
                 self._handle_logout()
                 return
+            if parts == ["login"]:
+                # GET /login has no page of its own past the login form
+                # itself -- reachable directly (a bookmark, an iOS "Add to
+                # Home Screen" shortcut saved from the form) once already
+                # authorized, and it's also where a successful login's
+                # "next" redirect points when that was the originally
+                # requested path. Routing it through here instead of
+                # falling into the catch-all 404 below sends an already-
+                # authorized visit straight home.
+                if self._authorized():
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self._send_login(head_only)
+                return
             if not self._authorized():
                 self._send_login(head_only)
                 return
