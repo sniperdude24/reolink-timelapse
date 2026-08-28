@@ -184,7 +184,10 @@ def _check_credentials(user: str, pin: str) -> Tuple[bool, float]:
         now = time.time()
         if now < _locked_until:
             return False, _locked_until - now
-        ok = (hmac.compare_digest(user.encode(), _auth[0].encode())
+        # Username is case-insensitive -- phone keyboards autocapitalize,
+        # and "Sniperdude" failing against "sniperdude" is a support trap,
+        # not security. The PIN is compared exactly.
+        ok = (hmac.compare_digest(user.casefold().encode(), _auth[0].casefold().encode())
               & hmac.compare_digest(pin.encode(), _auth[1].encode()))
         if ok:
             _fail_streak = 0

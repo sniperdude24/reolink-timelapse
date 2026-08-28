@@ -341,8 +341,9 @@ stream:
   auth_pin: "0424"   # quote it -- an unquoted leading zero is octal in YAML
 ```
 
-Browsers get a login form (sessions last ~30 days per device); VLC and
-other players authenticate with the URL form
+The username is case-insensitive (phone keyboards autocapitalize); the
+PIN must match exactly. Browsers get a login form (sessions last ~30
+days per device); VLC and other players authenticate with the URL form
 `http://yourname:0424@<host>:8177/live/<camera>/last_hour.mp4`. Brute
 force is blunted with a lockout — 5 straight failures locks the login
 for 30 seconds, doubling each failure up to 15 minutes — which makes
