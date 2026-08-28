@@ -141,7 +141,8 @@ class App:
         self._videos_cache: list = []
 
         self._build_widgets()
-        start_stream_server(host=self.config.stream_bind_host, log=self.log)
+        start_stream_server(host=self.config.stream_bind_host, log=self.log,
+                            auth=self.config.stream_auth)
         self.log("Live stream server ready -- Watch in VLC uses it, or open "
                  "http://<this address>:8177/live/<camera>/last_hour.mp4 in any player.")
         if self.config.migrated_from:
@@ -728,7 +729,8 @@ class App:
         # start_stream_server also revives the server if it ever died; the
         # URL must be read after this, not before, so a first-ever start
         # reflects the host it actually bound rather than the stale default.
-        start_stream_server(host=self.config.stream_bind_host, log=self.log)
+        start_stream_server(host=self.config.stream_bind_host, log=self.log,
+                            auth=self.config.stream_auth)
         url = stream_url(name)
         try:
             req = urllib.request.Request(url, method="HEAD")

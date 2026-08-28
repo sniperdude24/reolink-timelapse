@@ -188,6 +188,13 @@ class Config:
         # None = platform default (loopback-only on Windows, LAN-visible
         # on Linux -- see webstream.py). Overridable here for either.
         self.stream_bind_host: Optional[str] = None
+        # Username + PIN login for the stream server. Both must be set to
+        # enable; None (the shipped default) keeps it open like before.
+        # Stored as strings so a PIN's leading zeros survive -- quote the
+        # pin in YAML ("0424"), or an unquoted 0-prefixed number gets
+        # parsed as octal and silently becomes a different PIN.
+        self.stream_auth_user: Optional[str] = None
+        self.stream_auth_pin: Optional[str] = None
         # Auto-delete archived live sessions/ videos older than this many
         # days. None (the shipped default) = keep forever -- silently
         # deleting people's archives would be a nasty surprise, so
@@ -224,9 +231,21 @@ class Config:
             self.live_cameras = [live["camera_name"]]
         keep = live.get("sessions_keep_days")
         self.live_sessions_keep_days = int(keep) if keep else None
-        self.stream_bind_host = (raw.get("stream") or {}).get("bind_host")
+        stream = raw.get("stream") or {}
+        self.stream_bind_host = stream.get("bind_host")
+        user, pin = stream.get("auth_user"), stream.get("auth_pin")
+        self.stream_auth_user = str(user) if user is not None else None
+        self.stream_auth_pin = str(pin) if pin is not None else None
         if self.schema_migrated:
             self.save()
+
+    @property
+    def stream_auth(self) -> Optional[tuple]:
+        """(username, pin) when the stream login is fully configured,
+        else None -- the shape webstream.start_stream_server takes."""
+        if self.stream_auth_user and self.stream_auth_pin:
+            return (self.stream_auth_user, self.stream_auth_pin)
+        return None
 
     @staticmethod
     def _convert_setups_schema(raw: dict) -> dict:
@@ -283,8 +302,15 @@ class Config:
             live["sessions_keep_days"] = self.live_sessions_keep_days
         if live:
             raw["live"] = live
+        stream: dict = {}
         if self.stream_bind_host:
-            raw["stream"] = {"bind_host": self.stream_bind_host}
+            stream["bind_host"] = self.stream_bind_host
+        if self.stream_auth_user:
+            stream["auth_user"] = self.stream_auth_user
+        if self.stream_auth_pin:
+            stream["auth_pin"] = self.stream_auth_pin
+        if stream:
+            raw["stream"] = stream
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         if sys.platform != "win32":

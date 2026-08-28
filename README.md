@@ -329,18 +329,42 @@ the server binds to localhost only; on Linux/Raspberry Pi it's
 LAN-visible by default, which is what makes a headless Pi a household
 timelapse host.
 
+### Username + PIN login
+
+The server is open by default (a trusted-LAN posture, and what existing
+installs expect). To require a login on every page and video, set both
+keys under `stream:` in `config.yaml`:
+
+```yaml
+stream:
+  auth_user: yourname
+  auth_pin: "0424"   # quote it -- an unquoted leading zero is octal in YAML
+```
+
+Browsers get a login form (sessions last ~30 days per device); VLC and
+other players authenticate with the URL form
+`http://yourname:0424@<host>:8177/live/<camera>/last_hour.mp4`. Brute
+force is blunted with a lockout — 5 straight failures locks the login
+for 30 seconds, doubling each failure up to 15 minutes — which makes
+guessing even a 4-digit PIN take months, not minutes. Requests from the
+server's own machine skip the login (that's how the GUI's Watch-in-VLC
+button keeps working), **except** traffic delivered by a Cloudflare
+Tunnel running on the same host — that's remote traffic and always
+needs the login.
+
 ### Remote access (from outside your network)
 
-The server has **no authentication**, so never expose it with a router
-port-forward. The right shape for "watch from anywhere" is an
-authenticating tunnel in front of it — for example a Cloudflare Tunnel
-(`cloudflared` on the host pointing at `http://localhost:8177`) with a
-Cloudflare Access policy gating the hostname behind an email login.
-The tunnel makes an outbound connection, so no ports are opened and
-the host's IP stays private; the Access login happens in the browser
-before a single byte of video is served. Remote viewing then works in
-any browser; VLC (which can't complete a browser login) remains the
-LAN tool.
+Never expose the server with a router port-forward — even with the PIN
+login, plain HTTP would send credentials in the clear. The right shape
+for "watch from anywhere" is a tunnel in front of it — for example a
+Cloudflare Tunnel (`cloudflared` on the host pointing at
+`http://localhost:8177`), which makes an outbound connection (no open
+ports, host IP stays private) and serves remotely over HTTPS. With the
+username + PIN login enabled, that's a complete setup — and because
+players can send the PIN (unlike an email-login page), VLC works
+remotely too: `https://yourname:0424@timelapse.example.com/live/...`.
+Alternatively (or additionally), a Cloudflare Access policy can gate
+the hostname behind an email login; that's stronger but browser-only.
 
 That cap is also what keeps `session.mp4` current: rebuilding it is a full
 re-mux, so on an uncapped session the cost grows with the square of how

@@ -284,7 +284,8 @@ def cmd_live(args: argparse.Namespace) -> None:
     # under Timelapses/Live/<camera>/ -- the files webstream.py serves --
     # so this is the CLI path where starting it and printing the URL means
     # something. (Scheduled recordings via `run` have no such live view.)
-    start_stream_server(host=config.stream_bind_host, log=print)
+    start_stream_server(host=config.stream_bind_host, log=print,
+                        auth=config.stream_auth)
     print(f"Watch live at: {stream_url(camera.name)}")
     stop_event = threading.Event()
     worker = threading.Thread(
@@ -468,7 +469,8 @@ def cmd_serve_stream(args: argparse.Namespace) -> None:
     import time
 
     config = _open_config()
-    start_stream_server(host=config.stream_bind_host, log=print)
+    start_stream_server(host=config.stream_bind_host, log=print,
+                        auth=config.stream_auth)
     print("Live stream server running -- press Ctrl+C to stop.")
     try:
         while True:

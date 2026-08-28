@@ -23,17 +23,30 @@ Bind address is platform-dependent by default: loopback-only on Windows
 local screen to watch from), LAN-visible on Linux (a headless Pi has no
 screen of its own, so watching the feed means watching it from another
 device on the network). Either can be overridden via Config's
-stream_bind_host. There is no authentication -- fine on a trusted home
-LAN, never port-forward this. Remote access belongs behind an
-authenticating tunnel (e.g. Cloudflare Tunnel + Access, see README),
-never a raw router port-forward.
+stream_bind_host.
+
+Authentication is an opt-in username + PIN login (Config's
+stream_auth_user/stream_auth_pin; off by default so existing installs
+keep working). When enabled, every page and video requires either a
+logged-in session cookie (the login form, for browsers) or HTTP Basic
+credentials (for VLC: http://user:pin@host:8177/...). Brute force is
+blunted with a global lockout: 5 straight failures locks the login for
+30s, doubling per further failure up to 15 minutes. Requests from the
+same machine (loopback) skip auth -- EXCEPT when they carry Cloudflare
+headers, because a Cloudflare Tunnel's cloudflared runs on this same
+host and hands remote internet traffic to us *from* loopback; those
+requests must authenticate like any other remote visitor. A PIN gate
+still isn't a reason to port-forward this -- remote access belongs
+behind an HTTPS tunnel (see README) so the PIN isn't sent in the clear.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hmac
 import html
 import re
+import secrets
 import socket
 import sys
 import threading
@@ -41,17 +54,27 @@ import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 from .config import app_root_dir
 
 STREAM_PORT = 8177
 _ALLOWED_FILES = ("last_hour.mp4", "session.mp4")
 _STREAM_BLOCK = 65536
+_SESSION_SECONDS = 30 * 24 * 3600  # logged-in browsers stay logged in ~a month
+_LOCKOUT_AFTER = 5      # straight failures before the login locks...
+_LOCKOUT_BASE = 30.0    # ...for this many seconds, doubling per failure...
+_LOCKOUT_MAX = 900.0    # ...capped here. 10,000 PINs at ~15 min each = months.
 
 _server: Optional[ThreadingHTTPServer] = None
 _server_lock = threading.Lock()
 _bind_host: str = "127.0.0.1"  # updated by start_stream_server to whatever it actually bound
+
+_auth: Optional[Tuple[str, str]] = None  # (username, pin) or None = no login
+_auth_lock = threading.Lock()
+_sessions: dict = {}     # cookie token -> expiry timestamp
+_fail_streak: int = 0
+_locked_until: float = 0.0
 
 
 def default_bind_host() -> str:
@@ -109,7 +132,8 @@ def _root_index() -> bytes:
     items = "".join(
         f"<li><a href='/live/{quote(c)}/'>{html.escape(c)}</a></li>" for c in cameras
     ) or "<li class='m'>(no cameras have live folders yet)</li>"
-    return _page("Reolink Timelapse", f"<h2>Cameras</h2><ul>{items}</ul>")
+    logout = ("<p class='m'><a href='/logout'>log out</a></p>" if _auth else "")
+    return _page("Reolink Timelapse", f"<h2>Cameras</h2><ul>{items}</ul>{logout}")
 
 
 def _camera_index(camera: str) -> Optional[bytes]:
@@ -146,6 +170,72 @@ def _camera_index(camera: str) -> Optional[bytes]:
         f"<p><a href='/'>&larr; cameras</a></p><h2>{html.escape(camera)}</h2>"
         f"<h3>Live</h3><ul>{live_items}</ul>"
         f"<h3>Archived sessions</h3><ul>{archive_items}</ul>",
+    )
+
+
+def _check_credentials(user: str, pin: str) -> Tuple[bool, float]:
+    """(ok, locked_for_seconds). Wrong credentials feed the global
+    lockout; a correct login clears it. Comparisons are constant-time so
+    response timing leaks nothing about how close a guess was."""
+    global _fail_streak, _locked_until
+    if _auth is None:
+        return True, 0.0
+    with _auth_lock:
+        now = time.time()
+        if now < _locked_until:
+            return False, _locked_until - now
+        ok = (hmac.compare_digest(user.encode(), _auth[0].encode())
+              & hmac.compare_digest(pin.encode(), _auth[1].encode()))
+        if ok:
+            _fail_streak = 0
+        else:
+            _fail_streak += 1
+            if _fail_streak >= _LOCKOUT_AFTER:
+                _locked_until = now + min(
+                    _LOCKOUT_BASE * 2 ** (_fail_streak - _LOCKOUT_AFTER), _LOCKOUT_MAX)
+        return bool(ok), 0.0
+
+
+def _new_session() -> str:
+    token = secrets.token_urlsafe(32)
+    with _auth_lock:
+        now = time.time()
+        for tok in [t for t, exp in _sessions.items() if exp < now]:
+            del _sessions[tok]
+        _sessions[token] = now + _SESSION_SECONDS
+    return token
+
+
+def _session_valid(token: str) -> bool:
+    with _auth_lock:
+        exp = _sessions.get(token)
+        if exp is None or exp < time.time():
+            _sessions.pop(token, None)
+            return False
+        _sessions[token] = time.time() + _SESSION_SECONDS  # sliding expiry
+        return True
+
+
+def _safe_next(target: str) -> str:
+    """Only ever redirect within this site (no open redirect)."""
+    return target if target.startswith("/") and not target.startswith("//") else "/"
+
+
+def _login_page(next_path: str, error: str = "") -> bytes:
+    msg = f"<p style='color:#b00'>{html.escape(error)}</p>" if error else ""
+    return _page(
+        "Log in",
+        f"<h2>Reolink Timelapse</h2>{msg}"
+        f"<form method='post' action='/login'>"
+        f"<input type='hidden' name='next' value='{html.escape(_safe_next(next_path), quote=True)}'>"
+        f"<p><label>Username<br>"
+        f"<input name='username' autocomplete='username' autofocus "
+        f"style='font-size:1.2em;padding:.3em'></label></p>"
+        f"<p><label>PIN<br>"
+        f"<input name='pin' type='password' inputmode='numeric' pattern='[0-9]*' "
+        f"autocomplete='current-password' style='font-size:1.2em;padding:.3em'></label></p>"
+        f"<p><button style='font-size:1.1em;padding:.4em 1.5em'>Log in</button></p>"
+        f"</form>",
     )
 
 
@@ -260,10 +350,103 @@ class _Handler(BaseHTTPRequestHandler):
         if not head_only:
             self.wfile.write(page)
 
+    # -- authentication ---------------------------------------------------
+
+    def _cookie_token(self) -> str:
+        for part in (self.headers.get("Cookie") or "").split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == "rt_session":
+                return value
+        return ""
+
+    def _authorized(self) -> bool:
+        if _auth is None:
+            return True
+        # Same-machine tools (the GUI's Watch-in-VLC on Windows binds
+        # loopback-only) skip the login -- but only when the request
+        # didn't come through a Cloudflare Tunnel, whose cloudflared
+        # daemon runs on this host and delivers *internet* traffic from
+        # loopback. Tunnel requests always carry CF-Connecting-IP; a LAN
+        # client faking that header only makes itself stricter.
+        if (self.client_address[0] in ("127.0.0.1", "::1")
+                and "CF-Connecting-IP" not in self.headers):
+            return True
+        if _session_valid(self._cookie_token()):
+            return True
+        auth_header = self.headers.get("Authorization") or ""
+        if auth_header.startswith("Basic "):
+            try:
+                import base64
+                user, _, pin = base64.b64decode(
+                    auth_header[6:].strip()).decode("utf-8").partition(":")
+            except Exception:
+                return False
+            ok, _ = _check_credentials(user, pin)
+            return ok
+        return False
+
+    def _send_login(self, head_only: bool, error: str = "", status: int = 401) -> None:
+        page = _login_page(self.path, error)
+        self.send_response(status)
+        # The WWW-Authenticate challenge is what makes VLC (given
+        # http://user:pin@host/...) retry with credentials -- but it also
+        # makes browsers pop their native login box over our form, so
+        # only send it to clients that didn't ask for HTML.
+        if "text/html" not in (self.headers.get("Accept") or ""):
+            self.send_header("WWW-Authenticate", 'Basic realm="reolink-timelapse"')
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(page)))
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(page)
+
+    def _handle_login_post(self) -> None:
+        try:
+            length = min(int(self.headers.get("Content-Length") or 0), 4096)
+            form = parse_qs(self.rfile.read(length).decode("utf-8", "replace"))
+        except (ValueError, OSError):
+            form = {}
+        user = (form.get("username") or [""])[0]
+        pin = (form.get("pin") or [""])[0]
+        next_path = _safe_next((form.get("next") or ["/"])[0])
+        ok, locked_for = _check_credentials(user, pin)
+        if not ok:
+            error = (f"Too many wrong attempts -- locked for {int(locked_for) + 1}s."
+                     if locked_for else "Wrong username or PIN.")
+            self._send_login(head_only=False, error=error,
+                            status=429 if locked_for else 401)
+            return
+        self.send_response(303)
+        self.send_header("Location", next_path)
+        self.send_header(
+            "Set-Cookie",
+            f"rt_session={_new_session()}; Path=/; Max-Age={_SESSION_SECONDS}; "
+            f"HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _handle_logout(self) -> None:
+        with _auth_lock:
+            _sessions.pop(self._cookie_token(), None)
+        self.send_response(303)
+        self.send_header("Location", "/")
+        self.send_header("Set-Cookie",
+                         "rt_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    # -- routing ----------------------------------------------------------
+
     def _handle(self, head_only: bool) -> None:
         try:
             raw = self.path.split("?", 1)[0]
             parts = [unquote(p) for p in raw.strip("/").split("/")] if raw.strip("/") else []
+            if parts == ["logout"]:
+                self._handle_logout()
+                return
+            if not self._authorized():
+                self._send_login(head_only)
+                return
             if not parts:
                 self._send_html(_root_index(), head_only)
             elif len(parts) == 2 and parts[0] == "live":
@@ -285,20 +468,33 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:
         self._handle(head_only=True)
 
+    def do_POST(self) -> None:
+        try:
+            if self.path.split("?", 1)[0] == "/login":
+                self._handle_login_post()
+            else:
+                self.send_error(404)
+        except (ConnectionError, OSError):
+            pass
 
-def start_stream_server(host: Optional[str] = None, log: Callable[[str], None] = print) -> None:
+
+def start_stream_server(host: Optional[str] = None, log: Callable[[str], None] = print,
+                        auth: Optional[Tuple[str, str]] = None) -> None:
     """Start the server on a daemon thread. Idempotent; a busy port is
     logged and tolerated -- the app must keep working without the server.
 
     `host` overrides the platform default (see default_bind_host()) --
     pass a Config's stream_bind_host, or leave it as None to use the
-    default. If the serving thread ever dies, that is logged and the
-    dead server is forgotten, so the next call here brings it back -- the
-    Watch in VLC button calls this before every launch for exactly that
-    reason.
+    default. `auth` is (username, pin) to require a login on every page
+    and video (see module docstring), or None for the open default.
+    If the serving thread ever dies, that is logged and the dead server
+    is forgotten, so the next call here brings it back -- the Watch in
+    VLC button calls this before every launch for exactly that reason.
     """
-    global _server, _bind_host
+    global _server, _bind_host, _auth
     with _server_lock:
+        if auth and auth[0] and auth[1]:
+            _auth = (str(auth[0]), str(auth[1]))
         if _server is not None:
             return
         host = host or default_bind_host()
@@ -310,10 +506,14 @@ def start_stream_server(host: Optional[str] = None, log: Callable[[str], None] =
         server.daemon_threads = True
         _bind_host = host
         if host not in ("127.0.0.1", "localhost"):
-            log(f"Live stream server listening on {host}:{STREAM_PORT} -- reachable "
-                f"from other devices on your network. There is no password, so this "
-                f"is fine on a trusted home LAN but must never be port-forwarded "
-                f"or exposed to the internet.")
+            if _auth:
+                log(f"Live stream server listening on {host}:{STREAM_PORT} -- "
+                    f"username + PIN login required.")
+            else:
+                log(f"Live stream server listening on {host}:{STREAM_PORT} -- reachable "
+                    f"from other devices on your network. There is no password, so this "
+                    f"is fine on a trusted home LAN but must never be port-forwarded "
+                    f"or exposed to the internet.")
         threading.Thread(target=_serve, args=(server, log), daemon=True).start()
         _server = server
 
