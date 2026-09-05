@@ -62,6 +62,10 @@ services:
       - stream
 
   # ---- Raspberry Pi 5 variants (profile "pi"): hardware HEVC decode ----
+  # EXPERIMENTAL (see README): rpivid's small buffer pool can make the full
+  # convert pipeline fall back to software in a container. For reliable Pi
+  # hardware decode run bare-metal (packaging/pi/install.sh). Docker's real
+  # target for this app is an x86 mini PC / NAS on the generic image above.
   # Same services, built from Dockerfile.pi, handed the decode device nodes.
   # Set the camera's decode_mode to hardware (configure prompt) and run
   # `users`/`selftest-decode` the same way -- everything else is identical.

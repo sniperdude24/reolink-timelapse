@@ -9,8 +9,12 @@
 # "pi" profile does this): /dev/video19, /dev/media0 (the media-controller
 # node ffmpeg locates the decoder through -- measured 2026-09-04: without
 # it hwaccel silently falls back to software), /dev/dri and /dev/dma_heap.
-# Verified unprivileged as uid 1000: 0.27s CPU vs 10.0s software per 10s of
-# 4K footage inside the container.
+# Decode alone runs unprivileged as uid 1000 (0.27s CPU vs 10.0s software
+# per 10s of 4K). CAVEAT (measured 2026-09-04): rpivid has a small buffer
+# pool, so the full convert pipeline can hit "Failed to get dst buffer" and
+# fall back to software -- especially alongside another decoder on the host.
+# For reliable Pi hardware decode, run bare-metal (packaging/pi/install.sh),
+# not Docker. This image exists mainly for completeness.
 #
 #   docker build -f Dockerfile.pi -t reolink-timelapse:pi .
 FROM debian:bookworm-slim

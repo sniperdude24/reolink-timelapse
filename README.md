@@ -184,6 +184,19 @@ container. The generic image works on a Pi too, but decodes in software
 and runs it flat-out; see [Raspberry Pi / Linux](#raspberry-pi--linux)
 for what that costs.
 
+> **Hardware decode in a container is experimental (measured
+> 2026-09-04).** Decoding alone works inside the container, but the Pi
+> 5's rpivid block has a small buffer pool, and the full convert
+> pipeline — decode plus deflicker, scale, and encode holding frames at
+> once — can exhaust it (`Failed to get dst buffer`), especially if
+> anything else on the host is already using the decoder. When that
+> happens the app falls back to software decode automatically (the log
+> says so) — correct, but it gives up the speed the `pi` profile exists
+> for. For reliable hardware decode on a Pi, run it **bare-metal** via
+> the [install script](#raspberry-pi--linux), not Docker. Docker's real
+> home for this app is an x86 mini PC / NAS, where the generic image's
+> software decode is plenty.
+
 Remote access is the same story as every other install: an HTTPS tunnel
 in front of port 8177 with the login enabled — never a raw
 port-forward.
