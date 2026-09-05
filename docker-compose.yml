@@ -86,6 +86,9 @@ services:
     command: live --camera Backyard
     devices:
       - /dev/video19:/dev/video19   # rpivid HEVC decoder
+      - /dev/media0:/dev/media0     # its media-controller node -- ffmpeg FINDS the decoder
+                                    # through this; without it hwaccel silently falls back to
+                                    # software (check: v4l2-ctl --list-devices | grep -A2 hevc)
       - /dev/dri:/dev/dri           # DRM buffers the decoder hands frames through
       - /dev/dma_heap:/dev/dma_heap
     # Device nodes are owned by the host's video (44) and render (105) groups

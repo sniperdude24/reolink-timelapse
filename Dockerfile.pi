@@ -6,7 +6,11 @@
 # (`-hwaccel drm`, see decode.py). A generic image would silently fall
 # back to software decode and run the Pi flat-out. Build ON the Pi
 # (arm64) and give the container the decode devices (docker-compose.yml's
-# "pi" profile does this): /dev/video19 and /dev/dri.
+# "pi" profile does this): /dev/video19, /dev/media0 (the media-controller
+# node ffmpeg locates the decoder through -- measured 2026-09-04: without
+# it hwaccel silently falls back to software), /dev/dri and /dev/dma_heap.
+# Verified unprivileged as uid 1000: 0.27s CPU vs 10.0s software per 10s of
+# 4K footage inside the container.
 #
 #   docker build -f Dockerfile.pi -t reolink-timelapse:pi .
 FROM debian:bookworm-slim
