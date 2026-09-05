@@ -147,8 +147,26 @@ def hw_decoders_available(ffmpeg_bin: str) -> set:
                 listings[flag] = ""
         needle = spec.split(":", 1)[1] if spec.startswith("hwaccel:") else spec
         if needle in listings[flag].split():
+            if spec == "hwaccel:drm" and not _ffmpeg_has_v4l2_request(ffmpeg_bin):
+                # Every Linux ffmpeg lists a generic 'drm' hwaccel; only
+                # Raspberry Pi's patched build (--enable-v4l2-request) can
+                # actually drive rpivid through it. Seen for real in the
+                # generic Docker image on a Pi host (2026-09-04): device
+                # present, 'drm' listed, conversion failed outright.
+                continue
             available.add(spec)
     return available
+
+
+def _ffmpeg_has_v4l2_request(ffmpeg_bin: str) -> bool:
+    try:
+        r = subprocess.run(
+            [ffmpeg_bin, "-hide_banner", "-version"],
+            capture_output=True, text=True, timeout=10, **no_console_kwargs(),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "--enable-v4l2-request" in r.stdout
 
 
 def resolve_decoder(codec: Optional[str], mode: str, ffmpeg_bin: str) -> Optional[str]:
