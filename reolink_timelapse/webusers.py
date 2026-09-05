@@ -80,9 +80,25 @@ class UserStore:
         self._path = path or users_file_path()
         self._lock = threading.Lock()
         self._users: Dict[str, dict] = {}  # casefolded name -> record
+        self._mtime: Optional[int] = None  # file state the cache reflects
         self._load()
 
+    def _file_mtime(self) -> Optional[int]:
+        try:
+            return os.stat(self._path).st_mtime_ns
+        except OSError:
+            return None
+
+    def _refresh(self) -> None:
+        """Reload when the file changed underneath us -- the `users` CLI
+        (e.g. `docker exec ... users add`) edits the same file while the
+        server is running, and its changes must take effect without a
+        restart. Called with the lock held."""
+        if self._file_mtime() != self._mtime:
+            self._load()
+
     def _load(self) -> None:
+        self._mtime = self._file_mtime()
         try:
             with open(self._path, "r", encoding="utf-8") as f:
                 raw = yaml.safe_load(f) or {}
@@ -119,6 +135,7 @@ class UserStore:
             if sys.platform != "win32":
                 os.chmod(tmp, 0o600)
             os.replace(tmp, self._path)
+            self._mtime = self._file_mtime()
         except OSError:
             try:
                 os.unlink(tmp)
@@ -129,10 +146,13 @@ class UserStore:
     # -- queries ----------------------------------------------------------
 
     def __len__(self) -> int:
-        return len(self._users)
+        with self._lock:
+            self._refresh()
+            return len(self._users)
 
     def list_users(self) -> List[dict]:
         with self._lock:
+            self._refresh()
             return sorted(
                 ({"name": r["name"], "admin": r["admin"]}
                  for r in self._users.values() if not r["name"].startswith("\x00")),
@@ -143,6 +163,7 @@ class UserStore:
         Always burns a hash computation so a wrong username costs the
         same time as a wrong PIN."""
         with self._lock:
+            self._refresh()
             rec = self._users.get(username.casefold())
         if rec is None:
             verify_pin(pin, hash_pin("decoy"))  # constant-time-ish miss
@@ -151,6 +172,7 @@ class UserStore:
 
     def is_admin(self, username: str) -> bool:
         with self._lock:
+            self._refresh()
             rec = self._users.get(username.casefold())
         return bool(rec and rec["admin"])
 
@@ -166,6 +188,7 @@ class UserStore:
         if len(pin) < MIN_PIN_LEN:
             raise ValueError(f"PIN must be at least {MIN_PIN_LEN} characters.")
         with self._lock:
+            self._refresh()
             existing = self._users.get(username.casefold())
             if existing:
                 admin = admin or existing["admin"]  # updating never demotes
@@ -177,6 +200,7 @@ class UserStore:
         """Raises ValueError when removal would leave no admin able to
         manage users (the lock-yourself-out guard)."""
         with self._lock:
+            self._refresh()
             key = username.casefold()
             rec = self._users.get(key)
             if rec is None:

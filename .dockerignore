@@ -1,0 +1,23 @@
+# Never bake secrets or footage into an image
+config.yaml
+stream_users.yaml
+.env
+Timelapses/
+frames/
+*.mp4
+*.ts
+
+# Build/packaging noise
+.git/
+.venv/
+venv/
+build/
+dist/
+__pycache__/
+*.pyc
+*.egg-info/
+*.spec
+*.zip
+packaging/pi/
+build_exe.ps1
+entrypoint*.py

@@ -143,6 +143,51 @@ lower-res **substream** (`configure`'s
 "use the substream" prompt) is a separate, always-available lever to cut
 decode load if one Pi is running more cameras than it comfortably can.
 
+## Docker
+
+A third install path, for NAS boxes and anything else where "pull an
+image" is the normal way to run software. Headless only (the web viewer
+is the UI); everything stateful — `config.yaml`, the hashed
+`stream_users.yaml`, and `Timelapses/` — lives in one `./data` folder on
+the host, so the container is disposable and the data isn't.
+
+```bash
+git clone https://github.com/sniperdude24/reolink-timelapse.git
+cd reolink-timelapse
+docker compose up -d stream                                   # web viewer on :8177
+docker compose exec stream reolink-timelapse configure Backyard   # add a camera
+docker compose exec stream reolink-timelapse users add me --admin # first login
+docker compose up -d live-backyard                            # start its live timelapse
+```
+
+One `live-<camera>` service per camera (copy the block in
+`docker-compose.yml`). Manage logins afterwards from the web page
+(**manage users**) or with `reolink-timelapse users list|add|remove` via
+`docker compose exec` — a running server picks up changes instantly.
+The app finds its data folder through the `REOLINK_TIMELAPSE_HOME`
+environment variable, which the image sets to `/data`.
+
+**Moving an existing install into Docker** (say, from a Pi to a mini
+PC): stop the old services, copy its `config.yaml`, `stream_users.yaml`,
+and `Timelapses/` folder into `./data`, and `docker compose up -d`.
+Logins, cameras, and the whole archive carry over as-is; a
+`decode_mode: hardware` camera simply falls back to software decode on a
+host with no supported decoder (the log says so). For remote access, the
+`tunnel` profile runs `cloudflared` as a sidecar — see the comments in
+`docker-compose.yml`.
+
+**Raspberry Pi 5:** use the `pi` profile (`docker compose --profile pi
+up -d`). It builds from `Dockerfile.pi`, which installs Raspberry Pi OS's
+patched ffmpeg — the only build that can drive the Pi 5's rpivid
+hardware HEVC decoder — and hands the decode device nodes to the
+container. The generic image works on a Pi too, but decodes in software
+and runs it flat-out; see [Raspberry Pi / Linux](#raspberry-pi--linux)
+for what that costs.
+
+Remote access is the same story as every other install: an HTTPS tunnel
+in front of port 8177 with the login enabled — never a raw
+port-forward.
+
 ## Install (from source)
 
 ```bash

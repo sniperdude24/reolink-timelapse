@@ -453,6 +453,46 @@ def cmd_selftest_decode(args: argparse.Namespace) -> None:
              "Watch a longer run before fully trusting hardware decode here.")
 
 
+def cmd_users(args: argparse.Namespace) -> None:
+    """Manage the stream server's login accounts from the command line --
+    the same store the web UI's /users page edits, so this is how a
+    headless or containerised install creates its first admin (inside
+    Docker the host isn't loopback, so the "open localhost:8177/users on
+    the server itself" bootstrap doesn't apply). A running server picks
+    up changes immediately; no restart needed."""
+    from .webusers import UserStore, MIN_PIN_LEN
+
+    store = UserStore()
+    if args.action == "list":
+        users = store.list_users()
+        if not users:
+            print("No users -- the stream server is open (no login). "
+                  "Add one with: reolink-timelapse users add <name> --admin")
+        for u in users:
+            print(f"  {u['name']}" + ("  (admin)" if u["admin"] else ""))
+        return
+    if not args.name:
+        raise SystemExit(f"'users {args.action}' needs a username.")
+    if args.action == "remove":
+        try:
+            store.remove(args.name)
+        except ValueError as e:
+            raise SystemExit(f"ERROR: {e}")
+        print(f"Removed '{args.name}' (their logged-in devices stop working now).")
+        return
+    pin = args.pin
+    if pin is None:
+        pin = getpass.getpass(f"PIN for '{args.name}' ({MIN_PIN_LEN}+ characters): ")
+        if pin != getpass.getpass("Repeat PIN: "):
+            raise SystemExit("PINs didn't match.")
+    try:
+        store.put(args.name, pin, admin=args.admin)
+    except ValueError as e:
+        raise SystemExit(f"ERROR: {e}")
+    print(f"Saved '{args.name}'" + (" as an admin" if args.admin else "")
+          + f" in {store._path}")
+
+
 def cmd_serve_stream(args: argparse.Namespace) -> None:
     """Run the live-view web server on its own, decoupled from any one
     camera's capture process.
@@ -534,6 +574,19 @@ def main() -> None:
                                              "URLs work independently of any one camera's "
                                              "capture process, e.g. as its own systemd unit")
     p.set_defaults(func=cmd_serve_stream)
+
+    p = sub.add_parser("users", help="Manage stream-server login accounts: "
+                                      "'users list', 'users add <name> [--admin] [--pin X]', "
+                                      "'users remove <name>' -- the same accounts the web "
+                                      "UI's /users page manages; a running server sees "
+                                      "changes immediately")
+    p.add_argument("action", choices=["list", "add", "remove"])
+    p.add_argument("name", nargs="?", help="Username (for add/remove)")
+    p.add_argument("--admin", action="store_true",
+                    help="This user may manage other users (add)")
+    p.add_argument("--pin", default=None,
+                    help="PIN/passphrase (add); prompted for if omitted")
+    p.set_defaults(func=cmd_users)
 
     p = sub.add_parser("build", help="Rejoin the newest recorded session into an mp4 "
                                       "(lossless -- pacing was fixed at capture time)")

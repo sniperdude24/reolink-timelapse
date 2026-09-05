@@ -33,8 +33,14 @@ def app_root_dir() -> Path:
 
     Frozen (.exe): the exe's own folder -- mirrors rtsp.resolve_ffmpeg()'s
     frozen check. Source run: the repo/install root, two levels up from
-    this file.
+    this file. Either is overridden by the REOLINK_TIMELAPSE_HOME
+    environment variable -- the Docker image sets it to /data so config,
+    users, and footage all live on one mounted volume regardless of
+    where the package itself was installed.
     """
+    override = os.environ.get("REOLINK_TIMELAPSE_HOME")
+    if override:
+        return Path(override).expanduser()
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent

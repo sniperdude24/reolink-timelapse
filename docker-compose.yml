@@ -1,0 +1,97 @@
+# reolink-timelapse in Docker.
+#
+#   docker compose up -d                          # generic image (software decode)
+#   docker compose --profile pi up -d             # Raspberry Pi 5 image (hardware HEVC decode)
+#
+# First run: create config + the first admin login inside the container --
+#   docker compose exec stream reolink-timelapse configure Backyard
+#   docker compose exec stream reolink-timelapse users add me --admin
+# then start a live timelapse for that camera (one service per camera):
+#   docker compose up -d live-backyard
+#
+# Everything stateful lives in ./data on the host (config.yaml, the hashed
+# stream_users.yaml, and Timelapses/). Back that folder up; the images are
+# disposable. The web viewer is on http://<host>:8177/ -- put an HTTPS
+# tunnel in front of it for remote access (see README), never a raw
+# port-forward.
+
+x-common: &common
+  restart: unless-stopped
+  environment:
+    TZ: ${TZ:-UTC}
+  volumes:
+    - ./data:/data
+  # /data is owned by uid 1000 inside the image; match your host user so a
+  # bind mount is writable from both sides (PUID/PGID in a .env file).
+  user: "${PUID:-1000}:${PGID:-1000}"
+
+services:
+  # The web viewer / login / user management. Always on.
+  stream:
+    <<: *common
+    build: .
+    image: reolink-timelapse:latest
+    command: serve-stream
+    ports:
+      - "8177:8177"
+
+  # One of these per camera you want a rolling live timelapse for. Copy the
+  # block, change the name and --camera value.
+  live-backyard:
+    <<: *common
+    build: .
+    image: reolink-timelapse:latest
+    command: live --camera Backyard
+    depends_on:
+      - stream
+
+  # Optional: remote access through a Cloudflare Tunnel, as a sidecar. Create
+  # the tunnel in the Cloudflare dashboard (Zero Trust -> Networks -> Tunnels,
+  # public hostname -> http://stream:8177), put its token in .env as
+  # CLOUDFLARE_TUNNEL_TOKEN, and start it with: docker compose --profile tunnel up -d
+  # Traffic arrives from this container, not loopback, so the app's login is
+  # enforced on it exactly like any other remote visitor.
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    profiles: ["tunnel"]
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:?set CLOUDFLARE_TUNNEL_TOKEN in .env}
+    depends_on:
+      - stream
+
+  # ---- Raspberry Pi 5 variants (profile "pi"): hardware HEVC decode ----
+  # Same services, built from Dockerfile.pi, handed the decode device nodes.
+  # Set the camera's decode_mode to hardware (configure prompt) and run
+  # `users`/`selftest-decode` the same way -- everything else is identical.
+  stream-pi:
+    <<: *common
+    profiles: ["pi"]
+    build:
+      context: .
+      dockerfile: Dockerfile.pi
+    image: reolink-timelapse:pi
+    command: serve-stream
+    ports:
+      - "8177:8177"
+
+  live-backyard-pi:
+    <<: *common
+    profiles: ["pi"]
+    build:
+      context: .
+      dockerfile: Dockerfile.pi
+    image: reolink-timelapse:pi
+    command: live --camera Backyard
+    devices:
+      - /dev/video19:/dev/video19   # rpivid HEVC decoder
+      - /dev/dri:/dev/dri           # DRM buffers the decoder hands frames through
+      - /dev/dma_heap:/dev/dma_heap
+    # Device nodes are owned by the host's video (44) and render (105) groups
+    # on Raspberry Pi OS; change these if `getent group video render` differs.
+    group_add:
+      - "44"
+      - "105"
+    depends_on:
+      - stream-pi

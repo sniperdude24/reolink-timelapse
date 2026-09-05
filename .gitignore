@@ -21,3 +21,6 @@ venv/
 # camera credentials -- never commit it)
 config.yaml
 .env
+
+# Stream-server login accounts (hashed, but still per-install state)
+stream_users.yaml
