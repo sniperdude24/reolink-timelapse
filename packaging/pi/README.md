@@ -11,7 +11,9 @@ for the full walkthrough. Quick reference for what lives here:
 - `systemd/*.service` -- the raw unit templates `install.sh` copies into
   `~/.config/systemd/user/`, substituting `__REPO_DIR__`/`__VENV_BIN__`
   for your actual install path. Read these directly if you'd rather set
-  things up by hand than run a script.
+  things up by hand than run a script. `live@` and `run@` capture;
+  `stream` is the web server; `sunset@` builds one sunset video a day out
+  of the matching `live@` camera's footage, so it needs that unit running.
 
 Design notes (why it looks like this, not a Windows-style bundle):
 

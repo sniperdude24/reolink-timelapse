@@ -362,6 +362,54 @@ touches that camera's `sessions\` archive — never the live outputs, and
 never scheduled recordings' videos. It's always an explicit opt-in;
 nothing is deleted unless you set the key.
 
+### Daily sunset video
+
+A camera that's already running live can also produce **one video per
+day of the sunset**, `Timelapses\Sunset\<camera>\Sunset_<date>.mp4`,
+covering an hour before to an hour after sunset by default — about two
+minutes of 1080p at the live view's 60x. Sunset is computed fresh every
+day for your location (the same `astral` math the `daylight` schedule
+uses), so it tracks the seasons and needs no yearly upkeep.
+
+It doesn't open a second connection to the camera — streaming the same
+camera twice risks dropped frames in both (see *Notes* below). Instead it
+**borrows the live view's own 5-minute segments**: while the window is
+open it hardlinks each one into a staging folder as it appears, and when
+the window closes it joins them losslessly (`-c copy`). Zero extra camera
+or CPU load, identical quality, and hardlinks mean the copies cost no
+disk and survive the live view's 6-hour cleanup.
+
+Set it up with flags (no prompts, so it works over SSH), then run it
+alongside `live --camera <name>`:
+
+```
+reolink-timelapse sunset-config --camera Backyard --lat 36.0887 --lon -83.8192 --tz America/New_York
+reolink-timelapse sunset --camera Backyard
+```
+
+`sunset-config` prints today's computed sunset and window as a sanity
+check. Options: `--pre`/`--post` minutes either side of sunset (60/60),
+`--keep-days` to delete finished videos after N days (7; `0` keeps them
+forever). It saves under a `sunset:` key in `config.yaml`, one entry per
+camera.
+
+Two helpers for trying it out:
+
+- `sunset --camera Backyard --once [--date YYYY-MM-DD]` builds one day's
+  video right now from whatever in-window segments are on disk (the live
+  view keeps a full 6-hour block's worth), then exits.
+- `sunset --camera Backyard --print-schedule 14` prints the next two
+  weeks of sunsets and windows as CSV.
+
+If the live view isn't running during a sunset there's nothing to borrow:
+that day is logged and skipped, never a broken file. Stopping the job
+mid-window keeps what it had staged and resumes on the next start. On a
+Pi, `reolink-timelapse-sunset@<camera>.service` runs it as a service (see
+the Raspberry Pi section). The default 7-day retention exists because the
+usual reason for this feature is to copy each day's video to another
+machine (a nightly `rsync` from `Timelapses/Sunset/<camera>/` works well)
+— raise or zero it if the Pi is the video's only home.
+
 ### Watch live in VLC (self-updating)
 
 The **Watch in VLC** button opens the selected camera's last hour in VLC

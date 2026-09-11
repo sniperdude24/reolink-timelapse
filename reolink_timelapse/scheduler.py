@@ -101,17 +101,33 @@ def next_window(setup: Setup) -> Window:
     return window
 
 
-def _sleep_until(target: dt.datetime, setup: Setup, log, stop_event: threading.Event) -> bool:
-    """Sleep in short chunks until `target`. Returns True if stopped early."""
-    remaining = (target - _now(setup)).total_seconds()
+def sleep_until(target: dt.datetime, now_fn, log, stop_event: threading.Event) -> bool:
+    """Sleep in short chunks until `target`. Returns True if stopped early.
+
+    `now_fn` returns the current aware time; re-read every poll so the
+    remaining time tracks clock changes (DST, NTP corrections) instead of
+    a duration fixed at the start. Shared with sunset.py.
+
+    Remaining time is computed from POSIX timestamps, not by subtracting
+    the datetimes: two aware datetimes in the same ZoneInfo subtract as
+    wall-clock time, which would be an hour off across a DST change.
+    """
+    def remaining_seconds() -> float:
+        return target.timestamp() - now_fn().timestamp()
+
+    remaining = remaining_seconds()
     if remaining > 0:
         log(f"Sleeping until {target.strftime('%Y-%m-%d %H:%M:%S %Z')} "
             f"({remaining / 3600:.1f}h)...")
     while remaining > 0:
         if stop_event.wait(min(remaining, POLL_SECONDS)):
             return True
-        remaining = (target - _now(setup)).total_seconds()
+        remaining = remaining_seconds()
     return False
+
+
+def _sleep_until(target: dt.datetime, setup: Setup, log, stop_event: threading.Event) -> bool:
+    return sleep_until(target, lambda: _now(setup), log, stop_event)
 
 
 def _wait_capture(proc, window_end, setup: Setup, stop_event: threading.Event,

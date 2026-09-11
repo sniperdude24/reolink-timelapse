@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, fields, asdict
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -183,11 +183,55 @@ class Recording:
         )
 
 
+@dataclass
+class SunsetJob:
+    """A daily sunset video for one camera, assembled from that camera's
+    live rolling timelapse -- it never opens a second stream to the camera
+    (see sunset.py). Keyed by camera name in config.yaml's `sunset:`
+    section, so there is at most one per camera, and its output always
+    lives under Timelapses/Sunset/<camera>/ -- derived, not stored, like
+    every other storage location.
+
+    Location fields are Optional only so a hand-edited or half-written
+    section can't break loading the config for unrelated commands; the
+    CLI validates them when the job is created and again when it runs.
+    """
+    camera_name: str
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    timezone: Optional[str] = None
+    pre_minutes: int = 60   # window opens this long before sunset
+    post_minutes: int = 60  # ...and closes this long after
+    # Delete finished videos older than this many days. None/0 = keep
+    # forever. Defaults to a week (unlike live's opt-in retention) because
+    # this feature exists to hand videos off to another machine -- see
+    # the README -- and a Pi's SD card shouldn't quietly fill up meanwhile.
+    keep_days: Optional[int] = 7
+
+    @property
+    def is_configured(self) -> bool:
+        return (self.latitude is not None and self.longitude is not None
+                and bool(self.timezone))
+
+    @classmethod
+    def from_dict(cls, camera_name: str, data: dict) -> "SunsetJob":
+        known = {f.name for f in fields(cls)} - {"camera_name"}
+        kwargs = {k: v for k, v in (data or {}).items() if k in known}
+        return cls(camera_name=camera_name, **kwargs)
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d.pop("camera_name")
+        return d
+
+
 class Config:
     def __init__(self, path: Optional[Path] = None):
         self.path = path or default_config_path()
         self.cameras: dict[str, Camera] = {}
         self.recordings: dict[str, Recording] = {}
+        # Daily sunset videos, keyed by camera name (see SunsetJob).
+        self.sunset_jobs: dict[str, SunsetJob] = {}
         # Cameras the Live Timelapse panel had running; any number can run
         # at once. Restored on the next launch as the panel's selection.
         self.live_cameras: list[str] = []
@@ -227,6 +271,10 @@ class Config:
         self.recordings = {
             name: Recording.from_dict(name, data)
             for name, data in (raw.get("recordings") or {}).items()
+        }
+        self.sunset_jobs = {
+            name: SunsetJob.from_dict(name, data)
+            for name, data in (raw.get("sunset") or {}).items()
         }
         live = raw.get("live") or {}
         # "cameras" is the current shape; "camera_name" is the older
@@ -317,6 +365,10 @@ class Config:
             stream["auth_pin"] = self.stream_auth_pin
         if stream:
             raw["stream"] = stream
+        # Must be a first-class attribute: save() rebuilds the whole file,
+        # so any section not held here would vanish on the next save.
+        if self.sunset_jobs:
+            raw["sunset"] = {name: j.to_dict() for name, j in self.sunset_jobs.items()}
         with open(self.path, "w", encoding="utf-8") as f:
             yaml.safe_dump(raw, f, sort_keys=False)
         if sys.platform != "win32":
@@ -336,11 +388,24 @@ class Config:
             available = ", ".join(sorted(self.recordings)) or "(none configured yet)"
             raise SystemExit(f"No recording named '{name}'. Configured recordings: {available}")
 
+    def get_sunset(self, camera_name: str) -> SunsetJob:
+        try:
+            return self.sunset_jobs[camera_name]
+        except KeyError:
+            available = ", ".join(sorted(self.sunset_jobs)) or "(none configured yet)"
+            raise SystemExit(
+                f"No sunset job for camera '{camera_name}'. Configured: {available}. "
+                f"Add one with: reolink-timelapse sunset-config --camera {camera_name} "
+                f"--lat <latitude> --lon <longitude>")
+
     def put_camera(self, camera: Camera) -> None:
         self.cameras[camera.name] = camera
 
     def put_recording(self, recording: Recording) -> None:
         self.recordings[recording.name] = recording
+
+    def put_sunset(self, job: SunsetJob) -> None:
+        self.sunset_jobs[job.camera_name] = job
 
     def remove_camera(self, name: str) -> None:
         in_use = sorted(r.name for r in self.recordings.values() if r.camera_name == name)
@@ -348,6 +413,11 @@ class Config:
             raise SystemExit(
                 f"Camera '{name}' is still used by recording(s): {', '.join(in_use)}. "
                 f"Remove those recordings first."
+            )
+        if name in self.sunset_jobs:
+            raise SystemExit(
+                f"Camera '{name}' still has a sunset job. Remove the '{name}' entry "
+                f"under 'sunset:' in {self.path} first."
             )
         del self.cameras[name]
 

@@ -103,6 +103,11 @@ Next steps (nothing above started or enabled anything):
    ...or a scheduled recording (configure it first with 'record'):
      systemctl --user enable --now reolink-timelapse-run@<recording-name>.service
 
+   ...or one sunset video per day, cut from a camera's live timelapse
+   (needs that camera's live@ unit running; set the location first):
+     $VENV_BIN/reolink-timelapse sunset-config --camera <camera-name> --lat <lat> --lon <lon>
+     systemctl --user enable --now reolink-timelapse-sunset@<camera-name>.service
+
 Check status / logs:
      systemctl --user status reolink-timelapse-live@<camera-name>.service
      journalctl --user -u reolink-timelapse-live@<camera-name>.service -f

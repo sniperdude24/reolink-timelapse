@@ -6,8 +6,9 @@ import getpass
 import sys
 from pathlib import Path
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from .config import Camera, Config, Recording, Schedule, Setup, is_valid_timezone
+from .config import Camera, Config, Recording, Schedule, Setup, SunsetJob, is_valid_timezone
 from .chunks import refresh_output
 from .scheduler import daylight_window, run_scheduled
 from .webstream import start_stream_server, stream_url
@@ -250,6 +251,13 @@ def cmd_list(args: argparse.Namespace) -> None:
     for name, r in sorted(config.recordings.items()):
         print(f"  {name}: camera={r.camera_name} every {r.interval}s schedule={r.schedule.mode}")
 
+    if config.sunset_jobs:
+        print("\nSunset videos (daily, from the live timelapse):")
+        for name, j in sorted(config.sunset_jobs.items()):
+            print(f"  {name}: {j.pre_minutes} min before to {j.post_minutes} min after sunset "
+                  f"at {j.latitude}, {j.longitude} ({j.timezone}); "
+                  f"keep {f'{j.keep_days} days' if j.keep_days else 'forever'}")
+
 
 def cmd_remove_camera(args: argparse.Namespace) -> None:
     config = _open_config()
@@ -298,6 +306,108 @@ def cmd_live(args: argparse.Namespace) -> None:
             worker.join(timeout=0.5)
     except KeyboardInterrupt:
         print("\nStopping live timelapse (finishing the current chunk)...")
+        stop_event.set()
+        worker.join()
+
+
+def cmd_sunset_config(args: argparse.Namespace) -> None:
+    """Add or edit a camera's daily sunset job. Flags rather than prompts:
+    this is the one setup step a headless install does over SSH, and it
+    must be scriptable. Editing an existing job only needs the flags
+    that change."""
+    import tzlocal
+
+    from .sunset import sunset_dirs, sunset_window
+
+    config = _open_config()
+    config.get_camera(args.camera)  # a clear error if the camera doesn't exist
+    existing = config.sunset_jobs.get(args.camera)
+
+    def pick(flag, current, default):
+        if flag is not None:
+            return flag
+        return current if existing else default
+
+    lat = pick(args.lat, existing.latitude if existing else None, None)
+    lon = pick(args.lon, existing.longitude if existing else None, None)
+    if lat is None or lon is None:
+        raise SystemExit("--lat and --lon are required when adding a new sunset job.")
+    if not -90 <= lat <= 90:
+        raise SystemExit("--lat must be between -90 and 90.")
+    if not -180 <= lon <= 180:
+        raise SystemExit("--lon must be between -180 and 180.")
+    tz = pick(args.tz, existing.timezone if existing else None, None) or tzlocal.get_localzone_name()
+    if not is_valid_timezone(tz):
+        raise SystemExit(f"'{tz}' isn't a recognized IANA timezone name -- use the "
+                         f"Region/City form, e.g. America/New_York.")
+    pre = pick(args.pre, existing.pre_minutes if existing else None, 60)
+    post = pick(args.post, existing.post_minutes if existing else None, 60)
+    keep = pick(args.keep_days, existing.keep_days if existing else None, 7)
+    if pre < 0 or post < 0:
+        raise SystemExit("--pre and --post must be 0 or more minutes.")
+    if keep is not None and keep < 0:
+        raise SystemExit("--keep-days must be 0 (keep forever) or more.")
+
+    job = SunsetJob(camera_name=args.camera, latitude=lat, longitude=lon, timezone=tz,
+                    pre_minutes=pre, post_minutes=post, keep_days=keep or None)
+    config.put_sunset(job)
+    config.save()
+
+    out_dir, _ = sunset_dirs(args.camera)
+    print(f"Saved sunset job for camera '{args.camera}' to {config.path}")
+    print(f"  Location {lat}, {lon} ({tz}); recording {pre} min before to {post} min "
+          f"after sunset; videos kept {f'{keep} days' if keep else 'forever'} here.")
+    today = dt.datetime.now(ZoneInfo(tz)).date()
+    w = sunset_window(job, today)
+    print(f"  Today ({today}): sunset {w.sunset:%H:%M %Z}, window {w.start:%H:%M}-{w.end:%H:%M}.")
+    print(f"Videos will save as {out_dir / 'Sunset_<date>.mp4'}")
+    print(f"Run it with: reolink-timelapse sunset --camera {args.camera}   "
+          f"(needs 'live --camera {args.camera}' running -- it borrows that footage)")
+
+
+def cmd_sunset(args: argparse.Namespace) -> None:
+    import signal
+    import threading
+
+    from .sunset import build_once, print_schedule, run_sunset
+
+    config = _open_config()
+    job = config.get_sunset(args.camera)
+    if not job.is_configured:
+        raise SystemExit(f"The sunset job for '{args.camera}' has no location. Run: "
+                         f"reolink-timelapse sunset-config --camera {args.camera} "
+                         f"--lat <latitude> --lon <longitude>")
+    if args.date and not args.once:
+        raise SystemExit("--date only makes sense with --once.")
+
+    if args.print_schedule:
+        print_schedule(job, args.print_schedule)
+        return
+    if args.once:
+        date = args.date or dt.datetime.now(ZoneInfo(job.timezone)).date()
+        out = build_once(job, date, log=print)
+        if out is None:
+            sys.exit(1)
+        print(f"Saved: {out}")
+        return
+
+    stop_event = threading.Event()
+    # `systemctl stop` sends SIGTERM: turn it into a clean stop so a
+    # half-collected window stays staged for the next start instead of
+    # being killed mid-write.
+    try:
+        signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    except (ValueError, OSError, AttributeError):
+        pass  # not the main thread, or a platform without SIGTERM
+    worker = threading.Thread(target=run_sunset, args=(job, stop_event),
+                              kwargs={"log": print}, daemon=True)
+    worker.start()
+    print("Sunset job running -- press Ctrl+C to stop.")
+    try:
+        while worker.is_alive():
+            worker.join(timeout=0.5)
+    except KeyboardInterrupt:
+        print("\nStopping (any half-collected window is kept for next time)...")
         stop_event.set()
         worker.join()
 
@@ -556,6 +666,38 @@ def main() -> None:
                                      "(updates last_hour.mp4 and session.mp4 every ~5 min)")
     p.add_argument("--camera", required=True, help="Name of a configured camera")
     p.set_defaults(func=cmd_live)
+
+    p = sub.add_parser("sunset-config", help="Add or edit a camera's daily sunset video job "
+                                              "(location + how far either side of sunset); "
+                                              "flags, not prompts, so it works over SSH")
+    p.add_argument("--camera", required=True, help="Name of a configured camera")
+    p.add_argument("--lat", type=float, default=None, help="Latitude, decimal degrees")
+    p.add_argument("--lon", type=float, default=None, help="Longitude, decimal degrees")
+    p.add_argument("--tz", default=None,
+                    help="IANA timezone, e.g. America/New_York (default: this machine's)")
+    p.add_argument("--pre", type=int, default=None,
+                    help="Minutes before sunset to start (default: 60)")
+    p.add_argument("--post", type=int, default=None,
+                    help="Minutes after sunset to stop (default: 60)")
+    p.add_argument("--keep-days", type=int, default=None, dest="keep_days",
+                    help="Delete finished videos older than this many days; 0 = keep "
+                         "forever (default: 7)")
+    p.set_defaults(func=cmd_sunset_config)
+
+    p = sub.add_parser("sunset", help="Make one sunset video per day for a camera, assembled "
+                                       "from its running live timelapse (long-running; "
+                                       "configure it first with 'sunset-config')")
+    p.add_argument("--camera", required=True, help="Name of a configured camera")
+    mode = p.add_mutually_exclusive_group()
+    mode.add_argument("--once", action="store_true",
+                       help="Build one day's video now from the segments currently on "
+                            "disk, then exit -- for trying it out")
+    mode.add_argument("--print-schedule", type=int, default=None, metavar="DAYS",
+                       help="Print the next DAYS sunsets and recording windows as CSV, "
+                            "then exit -- a sanity check for the location")
+    p.add_argument("--date", type=dt.date.fromisoformat, default=None,
+                    help="With --once: which day to build (YYYY-MM-DD; default: today)")
+    p.set_defaults(func=cmd_sunset)
 
     p = sub.add_parser("gui", help="Launch the graphical control panel")
     p.set_defaults(func=cmd_gui)
