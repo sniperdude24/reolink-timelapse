@@ -194,8 +194,26 @@ for what that costs.
 > says so) — correct, but it gives up the speed the `pi` profile exists
 > for. For reliable hardware decode on a Pi, run it **bare-metal** via
 > the [install script](#raspberry-pi--linux), not Docker. Docker's real
-> home for this app is an x86 mini PC / NAS, where the generic image's
-> software decode is plenty.
+> home for this app is an x86 mini PC / NAS — see the Intel profile
+> below.
+
+**Intel mini PC / NAS (N95, N100, any Intel iGPU):** use the `intel`
+profile (`docker compose --profile intel up -d`, with `RENDER_GID` in
+`.env` set from `getent group render`). It builds from
+`Dockerfile.intel` (Ubuntu 26.04's ffmpeg 8 + Intel's iHD media driver)
+and decodes through **VAAPI**, keeping frames on the GPU so selection
+and the 4K→1080p scale happen there too; set the camera's decode mode to
+hardware and run `selftest-decode` first, as always. Measured on an N95
+against a real 4K HEVC camera (2026-10-07): a live timelapse at **~5% of
+the box** instead of ~35% in software (1.3–1.5 of its 4 cores), with
+decoded frames pixel-identical to software — unlike NVDEC on this same
+stream. Its failure mode is different: a chunk carrying damaged footage
+(lost RTSP packets) makes the GPU give up partway, so that chunk is
+retried on the GPU without the deflicker primer and then in software;
+hardware decode is only dropped for the session after 3 failed chunks in
+a row. Pull from the **NVR** channel rather than the camera if you have
+one (see [Notes](#notes--known-limitations)) — it's what keeps those
+software retries rare.
 
 Remote access is the same story as every other install: an HTTPS tunnel
 in front of port 8177 with the login enabled — never a raw

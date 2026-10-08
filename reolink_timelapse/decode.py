@@ -63,9 +63,41 @@ from .rtsp import build_rtsp_url, no_console_kwargs
 # software and latches hardware off for the session. (For "hwaccel:"
 # specs that latch rarely fires -- -hwaccel is advisory, so ffmpeg
 # falls back to software decode by itself instead of erroring.)
+#
+# x86 Linux with an Intel iGPU (i915/xe driver -- e.g. an N95/N100 mini
+# PC): VAAPI through Intel's iHD media driver, spec "vaapi". Unlike the
+# "hwaccel:" specs this one keeps frames ON the GPU (-hwaccel_output_
+# format vaapi) so selection and the 4K->1080p scale happen there and
+# only kept frames are downloaded -- convert_chunk builds a different
+# filter graph for it. Measured on the N95 against a real 5-minute 4K
+# chunk (2026-10-07): 36s CPU for the full live pipeline vs ~6 core-
+# minutes in software, and the frames it decodes are pixel-identical to
+# software (SSIM 1.000) on this camera family's tiled HEVC -- the stream
+# NVDEC corrupts. Its failure mode is different: a chunk with damaged
+# data (lost RTSP packets) makes the GPU hang (the kernel resets just
+# that context) and ffmpeg exits non-zero partway through, so
+# ChunkRenderer redoes that one chunk in software.
 _NVDEC_DECODERS = {"h264": "h264_cuvid", "hevc": "hevc_cuvid"}
 _PI_V4L2_DECODERS = {"h264": "h264_v4l2m2m", "hevc": "hevc_v4l2m2m"}
 _PI5_RPIVID = {"hevc": "hwaccel:drm"}
+_INTEL_VAAPI = {"h264": "vaapi", "hevc": "vaapi"}
+
+# Kernel drivers of Intel GPUs whose video engine iHD drives.
+_INTEL_DRM_DRIVERS = ("i915", "xe")
+
+
+def intel_render_node() -> Optional[str]:
+    """/dev/dri/renderD* of the first Intel GPU, or None. Device probing
+    via sysfs, no ffmpeg needed; fails closed on any filesystem hiccup."""
+    try:
+        from pathlib import Path
+        for node in sorted(Path("/sys/class/drm").glob("renderD*")):
+            driver = (node / "device" / "driver").resolve().name
+            if driver in _INTEL_DRM_DRIVERS and Path("/dev/dri", node.name).exists():
+                return f"/dev/dri/{node.name}"
+    except OSError:
+        pass
+    return None
 
 
 def _pi5_rpivid_present() -> bool:
@@ -97,7 +129,21 @@ def decoder_map_for_platform() -> dict:
         if _pi5_rpivid_present():
             return _PI5_RPIVID
         return _PI_V4L2_DECODERS
+    if sys.platform == "linux" and intel_render_node() is not None:
+        return _INTEL_VAAPI
     return {}
+
+
+def hw_mechanism_name() -> str:
+    """Human name of this host's hardware-decode family, for prompts."""
+    family = decoder_map_for_platform()
+    if family is _NVDEC_DECODERS:
+        return "NVDEC"
+    if family is _INTEL_VAAPI:
+        return "Intel VAAPI"
+    if family is _PI5_RPIVID:
+        return "rpivid"
+    return "V4L2 M2M"
 
 
 def hw_decode_platform() -> bool:
@@ -134,7 +180,7 @@ def hw_decoders_available(ffmpeg_bin: str) -> set:
     available = set()
     listings = {}  # ffmpeg flag -> its output, fetched at most once each
     for spec in specs:
-        flag = "-hwaccels" if spec.startswith("hwaccel:") else "-decoders"
+        flag = "-hwaccels" if spec.startswith("hwaccel:") or spec == "vaapi" else "-decoders"
         if flag not in listings:
             try:
                 r = subprocess.run(

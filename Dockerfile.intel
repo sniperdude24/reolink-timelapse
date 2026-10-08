@@ -1,0 +1,41 @@
+# reolink-timelapse -- x86_64 image WITH Intel iGPU (VAAPI) decode.
+#
+# Same app as the generic Dockerfile, for an Intel mini PC / NAS (N95,
+# N100, any i915/xe iGPU with Quick Sync). Built on Ubuntu 26.04 for its
+# ffmpeg 8 + Intel's iHD media driver -- the combination measured on a
+# real N95 (2026-10-07): the full live pipeline at ~36s CPU per 5-minute
+# 4K chunk instead of ~6 core-minutes in software, frames pixel-identical
+# to software decode. Give the container the GPU (/dev/dri) and the
+# host's render group (docker-compose.yml's "intel" profile does this),
+# then set the camera's decode_mode to hardware and run selftest-decode.
+#
+#   docker build -f Dockerfile.intel -t reolink-timelapse:intel .
+FROM ubuntu:26.04
+
+RUN apt-get update \
+ && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ffmpeg intel-media-va-driver-non-free tzdata python3 python3-venv \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY pyproject.toml README.md ./
+COPY reolink_timelapse ./reolink_timelapse
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir . && rm -rf /src
+
+# iHD is the driver for every iGPU this image targets; naming it skips
+# libva's guesswork (which can pick the older i965 driver and fail).
+ENV REOLINK_TIMELAPSE_HOME=/data \
+    PYTHONUNBUFFERED=1 \
+    LIBVA_DRIVER_NAME=iHD \
+    PATH="/opt/venv/bin:$PATH"
+# Ubuntu images ship a default 'ubuntu' user at uid 1000; replace it with
+# 'app' so /data ownership matches the generic and Pi images.
+RUN userdel -r ubuntu 2>/dev/null; useradd --uid 1000 --create-home app \
+ && mkdir -p /data && chown app:app /data
+USER app
+WORKDIR /data
+VOLUME ["/data"]
+EXPOSE 8177
+
+ENTRYPOINT ["reolink-timelapse"]
+CMD ["serve-stream"]

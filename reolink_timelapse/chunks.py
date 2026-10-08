@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from .capture import STDERR_TAIL_LINES, _drain_stderr
+from .decode import intel_render_node
 from .rtsp import build_rtsp_url, check_ffmpeg, no_console_kwargs
 
 CHUNK_SECONDS = 300
@@ -46,6 +47,10 @@ KEYFRAME_SNAP_MIN_INTERVAL = 5  # seconds; at/above this, keep keyframes only
 # then trim those warm-up frames back out of the output. See
 # convert_chunk's primer parameter.
 DEFLICKER_SIZE = 5
+
+# Consecutive chunks a hardware decoder may fail (each one retried in
+# software) before ChunkRenderer gives up on it for the session.
+HW_FAILURE_LIMIT = 3
 
 # Rendering is the only expensive step, and it arrives in bursts: ~55s at
 # ~1.7 cores (peak 3.5) for each 5-minute 4K chunk. Capturing is nearly
@@ -212,6 +217,18 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     # after select so it only sees frames that survive into the video.
     # With a primer it also smooths across the chunk boundary; without one
     # it can only smooth within the chunk.
+    vaapi = hw_decoder == "vaapi"
+    if vaapi:
+        # Frames are still GPU surfaces here (see decoder_flags below):
+        # select only reads their timestamps/picture type, so it runs on
+        # the GPU stream as-is; then scale (or just normalise to 8-bit
+        # nv12) on the GPU and download only the frames that were kept.
+        # Everything after this point is the same CPU graph as software.
+        if scale_width:
+            stages.append(f"scale_vaapi=w={scale_width}:h=-2:format=nv12")
+        else:
+            stages.append("scale_vaapi=format=nv12")
+        stages += ["hwdownload", "format=nv12"]
     stages.append("deflicker")
     if use_primer:
         # Drop the warm-up frames now that deflicker has consumed them.
@@ -220,7 +237,7 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
         # the last primer frame and the first kept frame of this chunk.
         primer_seconds = (DEFLICKER_SIZE + 1) * interval
         stages.append(f"trim=start={primer_seconds - interval / 2}")
-    if scale_width:
+    if scale_width and not vaapi:
         stages.append(f"scale={scale_width}:-2")
     stages.append(f"setpts=N/({output_fps}*TB)")
 
@@ -229,13 +246,35 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
     # ("hwaccel:drm" = Pi 5 rpivid) emitted as -hwaccel -- see decode.py.
     # -hwaccel is advisory: if it can't engage, ffmpeg quietly decodes in
     # software instead of erroring.
-    if hw_decoder and hw_decoder.startswith("hwaccel:"):
+    # "vaapi" (Intel iGPU) is the third kind: -hwaccel plus
+    # -hwaccel_output_format so decoded frames stay on the GPU for the
+    # scale_vaapi stage above -- unlike plain -hwaccel, NOT advisory: if
+    # VAAPI can't engage, the graph can't be built and ffmpeg fails
+    # (ChunkRenderer then retries the chunk in software).
+    global_flags = []
+    if vaapi:
+        global_flags = ["-init_hw_device", f"vaapi=va:{intel_render_node() or '/dev/dri/renderD128'}",
+                        "-filter_hw_device", "va"]
+        decoder_flags = ["-hwaccel", "vaapi", "-hwaccel_device", "va",
+                         "-hwaccel_output_format", "vaapi"]
+    elif hw_decoder and hw_decoder.startswith("hwaccel:"):
         decoder_flags = ["-hwaccel", hw_decoder.split(":", 1)[1]]
     elif hw_decoder:
         decoder_flags = ["-c:v", hw_decoder]
     else:
         decoder_flags = []
-    decode_flags = ["-fflags", "discardcorrupt", *decoder_flags]
+    # Keyframe-snapped intervals keep nothing but keyframes, so tell the
+    # decoder to skip everything else instead of decoding every frame and
+    # letting select throw ~49 of every 50 away. Measured 2026-10-07 on
+    # the N95 mini PC against 90s of real daytime 4K pulled from the
+    # camera directly (25 fps, keyframe every 2s -- via the NVR it's every
+    # 4s, so even more is skipped): 80.2s -> 10.0s CPU for the full convert pipeline, kept
+    # frames bit-identical (framemd5). Of 45 keyframes compared directly,
+    # the only ones that differed were already damaged by lost RTSP data
+    # (both decodes showing the same broken block). Not for shorter
+    # intervals: those select non-key frames too.
+    skip_flags = ["-skip_frame", "nokey"] if interval >= KEYFRAME_SNAP_MIN_INTERVAL else []
+    decode_flags = ["-fflags", "discardcorrupt", *skip_flags, *decoder_flags]
     if use_primer:
         inputs = [
             # -sseof: decode only the primer's tail, from the nearest
@@ -252,7 +291,7 @@ def convert_chunk(chunk: Path, segments_dir: Path, *, interval: float,
 
     cmd = [
         ffmpeg_bin, "-y", "-loglevel", "error", "-nostats",
-        *inputs,
+        *global_flags, *inputs,
         # -r is load-bearing, not redundant with setpts: without it ffmpeg
         # derives the output rate from the input stream's metadata (12.5
         # fps on this camera) and DROPS frames to match -- measured 11 of
@@ -338,6 +377,9 @@ class ChunkRenderer:
         self.segments: List[Path] = []
         self.processed: set = set()
         self.failed = 0
+        # Hardware-decode failures in a row; the decoder is only dropped
+        # for the session at HW_FAILURE_LIMIT (see process()).
+        self.hw_failures = 0
         # The most recent chunk, retained one extra cycle to prime the next
         # conversion's deflicker window (see convert_chunk). _pending_delete
         # is the successfully converted chunk awaiting deletion once its
@@ -377,6 +419,70 @@ class ChunkRenderer:
     def segment_mb(self) -> float:
         return sum(s.stat().st_size for s in self.segments if s.exists()) / 1e6
 
+    def _convert(self, chunk: Path, hw_decoder: Optional[str],
+                 primer: Optional[Path]) -> Path:
+        return convert_chunk(chunk, self.segments_dir, interval=self.interval,
+                             output_fps=self.output_fps, scale_width=self.scale_width,
+                             hw_decoder=hw_decoder, primer=primer, crf=self.crf)
+
+    def _convert_with_fallbacks(self, chunk: Path) -> Path:
+        """convert_chunk, degrading step by step instead of failing.
+
+        Neither optional input may take a chunk down with it: a damaged
+        primer must not cascade, and a hardware decoder that fails at
+        runtime must not fail the session (real case: a Pi 5's ffmpeg
+        lists h264/hevc_v4l2m2m but the board has no decode block, so the
+        decoder can't open). With both in play the hardware decoder is
+        retried without the primer first: Intel VAAPI gives up on damaged
+        data wherever it is, including in the previous chunk's tail that
+        the primer re-decodes -- seen for real (2026-10-07): one damaged
+        chunk then failed the clean chunk after it, and each software
+        redo costs a small box minutes of every core it's allowed. Last
+        resort is plain software decode with no primer.
+        """
+        attempts = [(self.hw_decoder, self._primer)]
+        if self.hw_decoder is not None and self._primer is not None:
+            attempts.append((self.hw_decoder, None))
+        if self.hw_decoder is not None or self._primer is not None:
+            attempts.append((None, None))
+        for i, (hw, primer) in enumerate(attempts):
+            try:
+                seg = self._convert(chunk, hw, primer)
+            except Exception:
+                if i == len(attempts) - 1:
+                    raise
+                nxt_hw, nxt_primer = attempts[i + 1]
+                dropped = [n for n, before, after in (
+                    ("deflicker primer", primer, nxt_primer),
+                    (f"hardware decoder '{hw}'", hw, nxt_hw)) if before and not after]
+                self.log(f"Converting {chunk.name} failed; retrying without "
+                         f"{' or '.join(dropped)}.")
+                continue
+            if hw is not None:
+                self.hw_failures = 0
+            elif self.hw_decoder is not None:
+                self._note_hw_failure(chunk)
+            return seg
+        raise AssertionError("unreachable")
+
+    def _note_hw_failure(self, chunk: Path) -> None:
+        """The chunk converted only in software. One failure isn't proof
+        the decoder can't work: Intel VAAPI decodes this camera fine but
+        gives up on a chunk with damaged data (lost RTSP packets), and
+        dropping it for the session over that would put a small box on
+        full software decode for good. Several in a row is a decoder that
+        doesn't work here -- stop paying a failed attempt on every chunk."""
+        self.hw_failures += 1
+        if self.hw_failures >= HW_FAILURE_LIMIT:
+            self.log(f"Hardware decoder '{self.hw_decoder}' failed {self.hw_failures} "
+                     f"chunks in a row; using software decode for the rest of this "
+                     f"session.")
+            self.hw_decoder = None
+        else:
+            self.log(f"Hardware decoder '{self.hw_decoder}' failed on {chunk.name} "
+                     f"(damaged footage?); converted it in software, keeping hardware "
+                     f"decode for the next chunk.")
+
     def process(self, proc: Optional[subprocess.Popen], *, include_newest: bool = False,
                 on_segment: Optional[Callable[["ChunkRenderer", bool], None]] = None,
                 final: bool = False) -> int:
@@ -399,39 +505,7 @@ class ChunkRenderer:
             try:
                 # Serialised across every camera -- see _RENDER_LOCK.
                 with _RENDER_LOCK:
-                    try:
-                        seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
-                                            output_fps=self.output_fps,
-                                            scale_width=self.scale_width,
-                                            hw_decoder=self.hw_decoder,
-                                            primer=self._primer, crf=self.crf)
-                    except Exception:
-                        if self._primer is None and self.hw_decoder is None:
-                            raise
-                        # Neither optional input may take a chunk down with
-                        # it: a damaged primer must not cascade, and a
-                        # hardware decoder that fails at runtime must not
-                        # fail the session (real case: a Pi 5's ffmpeg
-                        # lists h264/hevc_v4l2m2m but the board has no
-                        # decode block, so the decoder can't open). Retry
-                        # with plain software decode and no primer.
-                        dropped = [n for n, v in (("deflicker primer", self._primer),
-                                                  (f"hardware decoder '{self.hw_decoder}'",
-                                                   self.hw_decoder)) if v is not None]
-                        self.log(f"Converting {chunk.name} failed; retrying without "
-                                 f"{' or '.join(dropped)}.")
-                        seg = convert_chunk(chunk, self.segments_dir, interval=self.interval,
-                                            output_fps=self.output_fps,
-                                            scale_width=self.scale_width,
-                                            hw_decoder=None,
-                                            primer=None, crf=self.crf)
-                        if self.hw_decoder is not None:
-                            # The retry succeeded without it -- don't pay a
-                            # failed attempt on every future chunk.
-                            self.log(f"Hardware decoder '{self.hw_decoder}' doesn't "
-                                     f"work here; using software decode for the rest "
-                                     f"of this session.")
-                            self.hw_decoder = None
+                    seg = self._convert_with_fallbacks(chunk)
             except Exception as e:
                 self.failed += 1
                 self._primer = chunk  # still real adjacent footage for the next seam

@@ -2,6 +2,7 @@
 #
 #   docker compose up -d                          # generic image (software decode)
 #   docker compose --profile pi up -d             # Raspberry Pi 5 image (hardware HEVC decode)
+#   docker compose --profile intel up -d          # Intel iGPU image (VAAPI decode)
 #
 # First run: create config + the first admin login inside the container --
 #   docker compose exec stream reolink-timelapse configure Backyard
@@ -102,3 +103,37 @@ services:
       - "105"
     depends_on:
       - stream-pi
+
+  # ---- Intel iGPU variants (profile "intel"): VAAPI decode ----
+  # For an x86 mini PC / NAS with an Intel iGPU (N95, N100, ...). Built
+  # from Dockerfile.intel; decode and the 4K->1080p scale run on the GPU
+  # (~0.12 core for a live 4K timelapse on an N95 instead of ~1.3). Set
+  # the camera's decode_mode to hardware and run selftest-decode first.
+  # A chunk with damaged footage makes VAAPI give up; that chunk alone is
+  # redone in software, which the cpus cap keeps from swamping the box.
+  stream-intel:
+    <<: *common
+    profiles: ["intel"]
+    build:
+      context: .
+      dockerfile: Dockerfile.intel
+    image: reolink-timelapse:intel
+    command: serve-stream
+    ports:
+      - "8177:8177"
+
+  live-backyard-intel:
+    <<: *common
+    profiles: ["intel"]
+    image: reolink-timelapse:intel
+    command: live --camera Backyard
+    devices:
+      - /dev/dri:/dev/dri
+    # /dev/dri/renderD128 is owned by the host's render group, whose GID
+    # differs per distro -- set RENDER_GID from `getent group render`.
+    group_add:
+      - "${RENDER_GID:-109}"
+    cpus: 1.5
+    cpu_shares: 256
+    depends_on:
+      - stream-intel

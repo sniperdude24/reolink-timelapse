@@ -151,9 +151,9 @@ def cmd_configure(args: argparse.Namespace) -> None:
     ))
 
     decode_mode = existing.decode_mode if existing else "software"
-    from .decode import hw_decode_platform
+    from .decode import hw_decode_platform, hw_mechanism_name
     if hw_decode_platform():
-        mechanism = "NVDEC" if sys.platform == "win32" else "V4L2 M2M"
+        mechanism = hw_mechanism_name()
         want_hw = _prompt_yes_no(
             f"Try hardware video decode ({mechanism}) for this camera? "
             f"EXPERIMENTAL -- unvalidated on this camera's stream; run "
