@@ -551,6 +551,16 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if not parts:
                 self._send_html(_root_index(identity), head_only)
+            elif parts == ["login"]:
+                # Already logged in. Browsers land here on a refresh or
+                # back-navigation after the login POST (whose URL is
+                # /login) -- that used to be a bare 404 for a user who
+                # had just logged in successfully. Send them on instead.
+                query = parse_qs(self.path.split("?", 1)[1]) if "?" in self.path else {}
+                self.send_response(303)
+                self.send_header("Location", _safe_next((query.get("next") or ["/"])[0]))
+                self.send_header("Content-Length", "0")
+                self.end_headers()
             elif parts == ["users"]:
                 self._handle_users(identity, head_only)
             elif len(parts) == 2 and parts[0] == "live":
